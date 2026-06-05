@@ -1,12 +1,7 @@
 name: Build Moonlight Qt
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
-    branches: [ master, main ]
-  release:
-    types: [ published ]
+  workflow_dispatch:
 
 permissions:
   contents: write
