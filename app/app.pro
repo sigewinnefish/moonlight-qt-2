@@ -39,6 +39,8 @@ isEmpty(MOONLIGHT_NUMERIC_VERSION): MOONLIGHT_NUMERIC_VERSION = $$cat(version.tx
 
 TEMPLATE = app
 
+include(../file-mapping/file-mapping.pri)
+
 # The following define makes your compiler emit warnings if you use
 # any feature of Qt which has been marked as deprecated (the exact warnings
 # depend on your compiler). Please consult the documentation of the
@@ -65,7 +67,7 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
+    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib uuid.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
 }
 macx:!disable-prebuilts {
     !exists($$PWD/../libs/mac) {
@@ -83,6 +85,16 @@ unix:if(!macx|disable-prebuilts) {
     # We have our own optimized libopus.a for Steam Link
     if(!config_SL|disable-prebuilts) {
         PKGCONFIG += opus
+    }
+
+    # Desktop overlay event monitors are independent of the video decoder.
+    # Keep these checks outside !disable-ffmpeg so software-only builds can
+    # still avoid polling Qt while the floating button is idle.
+    linux:!config_SL {
+        !disable-x11:packagesExist(xcb) {
+            DEFINES += HAVE_XCB_DISPLAY_MONITOR
+            PKGCONFIG += xcb
+        }
     }
 
     !disable-ffmpeg {
@@ -168,15 +180,44 @@ win32 {
     CONFIG += ffmpeg libplacebo
 }
 win32:!winrt {
+    DEFINES += HAVE_WINDOWS_RAW_TOUCHPAD HAVE_WINDOWS_PEN_INPUT
+    LIBS += -lhid
+    SOURCES += \
+        streaming/input/wintouchpad.cpp \
+        streaming/input/winpen.cpp
+    HEADERS += streaming/input/wintouchpad.h
+
     CONFIG += discord-rpc
 }
+
+# Developer-only streaming diagnostics. The implementation and menu entries are
+# omitted unless the build environment explicitly enables them.
+MOONLIGHT_FUNCTION_TESTS_ENABLED = $$(MOONLIGHT_ENABLE_FUNCTION_TESTS)
+win32:!winrt:equals(MOONLIGHT_FUNCTION_TESTS_ENABLED, 1) {
+    DEFINES += MOONLIGHT_ENABLE_FUNCTION_TESTS
+    LIBS += comdlg32.lib
+    SOURCES += \
+        streaming/input/stylusreplay.cpp \
+        streaming/input/stylusreplaytest.cpp \
+        streaming/video/stylusreplaypanel.cpp
+    HEADERS += \
+        streaming/input/stylusreplay.h \
+        streaming/input/stylusreplaytest.h \
+        streaming/video/stylusreplaypanel.h
+}
+
 macx {
+    DEFINES += HAVE_MACOS_NATIVE_TOUCHPAD
+
     !disable-prebuilts {
-        LIBS += -lssl.3 -lcrypto.3 -lavcodec.62 -lavutil.60 -lswscale.9 -lopus.0 -lSDL2 -lSDL2_ttf
-        CONFIG += discord-rpc
+        LIBS += -lssl.3 -lcrypto.3 -lavcodec.63 -lavutil.61 -lswscale.10 -lopus.0 -lSDL2 -lSDL2_ttf -lplacebo
+        CONFIG += discord-rpc libplacebo
     }
 
-    LIBS += -lobjc -framework VideoToolbox -framework AVFoundation -framework CoreVideo -framework CoreGraphics -framework CoreMedia -framework AppKit -framework UniformTypeIdentifiers -framework Metal -framework MetalFx -framework QuartzCore
+    LIBS += -lobjc -framework VideoToolbox -framework AVFoundation -framework CoreVideo -framework CoreGraphics -framework CoreMedia -framework AppKit -framework UniformTypeIdentifiers -framework Metal -framework MetalFx -framework QuartzCore -framework GameController -framework CoreHaptics
+
+    SOURCES += streaming/audio/dualsensehapticsmac.mm
+    HEADERS += streaming/audio/dualsensehapticsmac.h
 
     # For libsoundio
     LIBS += -framework CoreAudio -framework AudioUnit
@@ -202,17 +243,26 @@ SOURCES += \
     cli/quitstream.cpp \
     cli/startstream.cpp \
     settings/compatfetcher.cpp \
+    settings/devicelocalsettings.cpp \
     settings/mappingfetcher.cpp \
     settings/streamingpreferences.cpp \
     streaming/input/abstouch.cpp \
+    streaming/input/cursorshapeclassifier.cpp \
     streaming/input/gamepad.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
     streaming/input/mouse.cpp \
+    streaming/input/touchpad.cpp \
     streaming/input/reltouch.cpp \
     streaming/session.cpp \
-    streaming/clipboardsync.cpp \
+    streaming/filemappingclient.cpp \
+    streaming/filemappingwebsocket.cpp \
+    streaming/filemappingprotocoladapter.cpp \
+    streaming/filemappingux.cpp \
+    streaming/clipboardhelperclient.cpp \
+    streaming/clipboardipc.cpp \
     streaming/audio/audio.cpp \
+    streaming/audio/dualsensehaptics.cpp \
     streaming/audio/renderers/sdlaud.cpp \
     streaming/network/bandwidth.cpp \
     gui/computermodel.cpp \
@@ -224,11 +274,19 @@ SOURCES += \
     path.cpp \
     settings/mappingmanager.cpp \
     gui/sdlgamepadkeynavigation.cpp \
+    gui/windowplacement.cpp \
+    gui/windowsdisplaygeometry.cpp \
+    gui/windowswindowchrome.cpp \
     streaming/video/overlaymanager.cpp \
     streaming/video/overlaymenupanel.cpp \
+    streaming/video/overlaybuttonposition.cpp \
     streaming/video/overlaymenubutton.cpp \
     streaming/video/overlaytoast.cpp \
     backend/systemproperties.cpp \
+    backend/usbforwardingenvironment.cpp \
+    backend/usbforwardingbackend.cpp \
+    backend/usbforwardinglocalserver.cpp \
+    backend/usbforwardingtunnel.cpp \
     wm.cpp \
     imageutils.cpp \
     streaming/video/videoenhancement.cpp
@@ -237,8 +295,13 @@ HEADERS += \
     SDL_compat.h \
     backend/nvaddress.h \
     backend/nvapp.h \
+    backend/usbforwardingenvironment.h \
+    backend/usbforwardingbackend.h \
+    backend/usbforwardinglocalserver.h \
+    backend/usbforwardingtunnel.h \
     cli/pair.h \
     settings/compatfetcher.h \
+    settings/devicelocalsettings.h \
     settings/mappingfetcher.h \
     streaming/video/videoenhancement.h \
     utils.h \
@@ -246,6 +309,7 @@ HEADERS += \
     backend/identitymanager.h \
     backend/nvcomputer.h \
     backend/nvhttp.h \
+    backend/usbforwardingcapability.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
     backend/boxartmanager.h \
@@ -255,10 +319,21 @@ HEADERS += \
     cli/quitstream.h \
     cli/startstream.h \
     settings/streamingpreferences.h \
+    streaming/input/cursorshapeclassifier.h \
+    streaming/input/penhistory.h \
     streaming/input/input.h \
     streaming/session.h \
-    streaming/clipboardsync.h \
+    streaming/filemappingclient.h \
+    streaming/filemappingwebsocket.h \
+    streaming/filemappingprotocoladapter.h \
+    streaming/filemappingux.h \
+    streaming/clipboardhelperclient.h \
+    streaming/clipboardipc.h \
     streaming/audio/renderers/renderer.h \
+    streaming/audio/dualsensehaptics.h \
+    streaming/audio/dualsensehapticscalibration.h \
+    streaming/audio/dualsensehapticsrouting.h \
+    streaming/audio/dualsensehapticsstream.h \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
     gui/appmodel.h \
@@ -271,12 +346,19 @@ HEADERS += \
     path.h \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
+    gui/windowplacement.h \
+    gui/windowsdisplaygeometry.h \
+    gui/windowswindowchrome.h \
     streaming/video/overlaymanager.h \
     streaming/video/overlaymenupanel.h \
+    streaming/video/overlaybuttonposition.h \
+    streaming/video/overlayeventwakestate.h \
     streaming/video/overlaymenubutton.h \
+    streaming/video/overlaytoasteventstate.h \
     streaming/video/overlaytoast.h \
     backend/systemproperties.h \
-    imageutils.h
+    imageutils.h \
+    uifont.h
 
 # Conditional files for non-Steam Link builds
 !config_SL: SOURCES += streaming/micstream.cpp
@@ -285,6 +367,24 @@ HEADERS += \
 !config_SL:macx: SOURCES += streaming/macpermissions.mm
 !config_SL:!macx: SOURCES += streaming/macpermissions_stub.cpp
 
+# 把红绿灯沉到我们自己那条 bar 的中线上，顺带让 AppKit 的标题栏拖动区覆盖整条 bar
+macx {
+    HEADERS += \
+        gui/macwindowchrome.h \
+        streaming/video/macqteventpumpinputguard.h \
+        streaming/video/overlayeventmonitor_mac.h
+    SOURCES += \
+        gui/macwindowchrome.mm \
+        streaming/video/macqteventpumpinputguard.mm \
+        streaming/video/overlayeventmonitor_mac.mm
+}
+
+linux:!config_SL {
+    DEFINES += HAVE_LINUX_DISPLAY_EVENT_MONITOR
+    HEADERS += streaming/video/overlayeventmonitor_linux.h
+    SOURCES += streaming/video/overlayeventmonitor_linux.cpp
+}
+
 # Platform-specific renderers and decoders
 ffmpeg {
     message(FFmpeg decoder selected)
@@ -292,6 +392,7 @@ ffmpeg {
     DEFINES += HAVE_FFMPEG
     SOURCES += \
         streaming/video/ffmpeg.cpp \
+        streaming/video/av1obu.cpp \
         streaming/video/ffmpeg-renderers/genhwaccel.cpp \
         streaming/video/ffmpeg-renderers/sdlvid.cpp \
         streaming/video/ffmpeg-renderers/swframemapper.cpp \
@@ -299,6 +400,7 @@ ffmpeg {
 
     HEADERS += \
         streaming/video/ffmpeg.h \
+        streaming/video/av1obu.h \
         streaming/video/ffmpeg-renderers/renderer.h \
         streaming/video/ffmpeg-renderers/genhwaccel.h \
         streaming/video/ffmpeg-renderers/sdlvid.h \
@@ -392,6 +494,10 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
         streaming/video/ffmpeg-renderers/plvk.h
+
+    macx {
+        SOURCES += streaming/video/ffmpeg-renderers/plvk_objc.mm
+    }
 }
 config_EGL {
     message(EGL renderer selected)
@@ -560,8 +666,8 @@ win32:CONFIG(release, debug|release): LIBS += -L$$OUT_PWD/../h264bitstream/relea
 else:win32:CONFIG(debug, debug|release): LIBS += -L$$OUT_PWD/../h264bitstream/debug/ -lh264bitstream
 else:unix: LIBS += -L$$OUT_PWD/../h264bitstream/ -lh264bitstream
 
-INCLUDEPATH += $$PWD/../h264bitstream/h264bitstream
-DEPENDPATH += $$PWD/../h264bitstream/h264bitstream
+INCLUDEPATH += $$PWD/../h264bitstream
+DEPENDPATH += $$PWD/../h264bitstream
 
 !winrt {
     win32:CONFIG(release, debug|release): LIBS += -L$$OUT_PWD/../AntiHooking/release/ -lAntiHooking
@@ -597,9 +703,9 @@ unix:!macx: {
 }
 win32 {
     RC_ICONS = moonlight.ico
-    QMAKE_TARGET_COMPANY = Moonlight Game Streaming Project
-    QMAKE_TARGET_DESCRIPTION = Moonlight Game Streaming Client
-    QMAKE_TARGET_PRODUCT = Moonlight
+    QMAKE_TARGET_COMPANY = Moonlight V+ Project
+    QMAKE_TARGET_DESCRIPTION = Moonlight V+ for PC Game Streaming Client
+    QMAKE_TARGET_PRODUCT = Moonlight V+ for PC
 
     CONFIG -= embed_manifest_exe
     QMAKE_LFLAGS += /MANIFEST:embed /MANIFESTINPUT:$${PWD}/Moonlight.exe.manifest

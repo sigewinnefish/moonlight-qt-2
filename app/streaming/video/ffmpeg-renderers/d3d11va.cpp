@@ -294,6 +294,7 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
     HRESULT hr;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> deviceContext;
+    LARGE_INTEGER umdVersion;
 
     SDL_assert(!m_RenderDevice);
     SDL_assert(!m_RenderDeviceContext);
@@ -325,12 +326,25 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         goto Exit;
     }
 
+    // Query the GPU driver version
+    hr = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umdVersion);
+    if (FAILED(hr)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "IDXGIAdapter::CheckInterfaceSupport() failed: %x",
+                     hr);
+        goto Exit;
+    }
+
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Detected GPU %d: %S (%x:%x)",
+                "Detected GPU %d: %S (%x:%x) (driver: %u.%u.%u.%u)",
                 adapterIndex,
                 adapterDesc.Description,
                 adapterDesc.VendorId,
-                adapterDesc.DeviceId);
+                adapterDesc.DeviceId,
+                HIWORD(umdVersion.HighPart),
+                LOWORD(umdVersion.HighPart),
+                HIWORD(umdVersion.LowPart),
+                LOWORD(umdVersion.LowPart));
 
     hr = D3D11CreateDevice(adapter.Get(),
                            D3D_DRIVER_TYPE_UNKNOWN,
@@ -409,22 +423,29 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         separateDevices = SUCCEEDED(hr) && d3d11Options.ExtendedResourceSharing && m_FenceType != SupportedFenceType::None;
 
         if (separateDevices) {
-            // The Radon HD 5570 GPU drivers deadlock when decoding into shared texture arrays, so let's
-            // limit usage of separate devices to FL 11.1+ GPUs to try to exclude old GPU drivers. We'll
-            // exempt Intel GPUs because those have been confirmed to work properly (and the extra fence
-            // that this device separation uses acts as a workaround for a bug in their old drivers where
-            // they don't properly synchronize between decoder output usage and SRV usage).
-            if (featureLevel < D3D_FEATURE_LEVEL_11_1 && adapterDesc.VendorId != 0x8086) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Avoiding texture sharing for old pre-FL11.1 GPU");
-                separateDevices = false;
+            // Use minimum precision support to differentiate Vega and later from Polaris and earlier
+            D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT minPrecSupport;
+            hr = m_RenderDevice->CheckFeatureSupport(D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT, &minPrecSupport, sizeof(minPrecSupport));
+            if (FAILED(hr)) {
+                minPrecSupport = {};
             }
-            else if (adapterDesc.VendorId == 0x1ED5 || // Moore Threads (texture is all zero/green)
-                     adapterDesc.VendorId == 0x4D4F4351) { // Qualcomm (decoding is unstable/slow on QC710)
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Avoiding texture sharing on known broken GPU vendor");
-                separateDevices = false;
-            }
+
+            // This texture array sharing codepath is quite prone to driver bugs.
+            //
+            // Broken GPU vendors/cards/drivers include:
+            // - Moore Threads (texture is all zero/green)
+            // - Qualcomm (decoding is unstable/slow on QC710)
+            // - AMD prior to Vega (Polaris cards display corrupt output - see #2003,
+            //                      HD 5570 drivers deadlock with shared texture arrays)
+            // - Nvidia drivers prior to ~471.11 (Earlier drivers display all zero/green,
+            //                                    We approximate by requiring WDDM 3.0+)
+            //
+            // Due to all these issues, we will only use this path for Intel/AMD and NVIDIA where we know it
+            // provides tangible benefits (performance for the former and VRR support for the latter).
+            separateDevices = adapterDesc.VendorId == 0x8086 || // Intel
+                              (adapterDesc.VendorId == 0x10DE && HIWORD(umdVersion.HighPart) >= 30) || // NVIDIA WDDM 3.0+ (PCI ID)
+                              adapterDesc.VendorId == 'ADVN' || // NVIDIA (WoA)
+                              (adapterDesc.VendorId == 0x1002 && (minPrecSupport.PixelShaderMinPrecision & D3D11_SHADER_MIN_PRECISION_16_BIT)); // AMD Vega+
         }
     }
 
@@ -444,12 +465,10 @@ bool D3D11VARenderer::createDeviceByAdapterIndex(int adapterIndex, bool* adapter
         // significant performance impact of the extra copy. See:
         // https://github.com/moonlight-stream/moonlight-qt/issues/1304
         //
-        // Also bind SRVs when using separate decoding and rendering
-        // devices as this improves render times by about 2x on my
-        // Ryzen 3300U system. The fences we use between decoding
-        // and rendering contexts should hopefully avoid any of the
-        // synchronization issues we've seen between decoder and SRVs.
-        m_BindDecoderOutputTextures = adapterDesc.VendorId == 0x8086 || separateDevices;
+        // Also bind SRVs as this improves render times by about 2x on
+        // my Ryzen 3300U system.
+        m_BindDecoderOutputTextures = adapterDesc.VendorId == 0x8086 ||
+                                      separateDevices;
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2168,13 +2187,46 @@ bool D3D11VARenderer::needsTestFrame()
 
 void D3D11VARenderer::setHdrMode(bool enabled)
 {
-    // m_VideoProcessor needs to be available to be set,
-    // and it makes sense only when HDR is enabled from the UI
-    if (!enabled || !m_VideoProcessor || !(m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_10BIT))
-        return;
+    auto clearVideoProcessorOutputHdrMetadata = [this]() {
+        if (m_VideoProcessor && m_VideoContext) {
+            m_VideoContext->VideoProcessorSetOutputHDRMetaData(
+                m_VideoProcessor.Get(),
+                DXGI_HDR_METADATA_TYPE_NONE,
+                0,
+                nullptr);
+        }
+    };
 
-    DXGI_HDR_METADATA_HDR10 streamHDRMetaData;
-    DXGI_HDR_METADATA_HDR10 outputHDRMetaData;
+    auto clearHdrMetadata = [this, &clearVideoProcessorOutputHdrMetadata]() {
+        if (m_VideoProcessor && m_VideoContext) {
+            m_VideoContext->VideoProcessorSetStreamHDRMetaData(
+                m_VideoProcessor.Get(),
+                0,
+                DXGI_HDR_METADATA_TYPE_NONE,
+                0,
+                nullptr);
+        }
+        clearVideoProcessorOutputHdrMetadata();
+
+        if (!m_SwapChain) {
+            return;
+        }
+
+        HRESULT hr = m_SwapChain->SetHDRMetaData(
+            DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+        if (FAILED(hr)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "IDXGISwapChain4::SetHDRMetaData(NONE) failed: %x", hr);
+        }
+    };
+
+    if (!enabled || !(m_DecoderParams.videoFormat & VIDEO_FORMAT_MASK_10BIT)) {
+        clearHdrMetadata();
+        return;
+    }
+
+    DXGI_HDR_METADATA_HDR10 streamHDRMetaData = {};
+    DXGI_HDR_METADATA_HDR10 outputHDRMetaData = {};
 
     // Prepare HDR Meta Data for Streamed content
     bool streamSet = false;
@@ -2190,21 +2242,53 @@ void D3D11VARenderer::setHdrMode(bool enabled)
         streamHDRMetaData.WhitePoint[1] = hdrMetadata.whitePoint.y;
         streamHDRMetaData.MaxMasteringLuminance = hdrMetadata.maxDisplayLuminance;
         streamHDRMetaData.MinMasteringLuminance = hdrMetadata.minDisplayLuminance;
-        streamHDRMetaData.MaxContentLightLevel = 0;
-        streamHDRMetaData.MaxFrameAverageLightLevel = 0;
+        streamHDRMetaData.MaxContentLightLevel = hdrMetadata.maxContentLightLevel;
+        streamHDRMetaData.MaxFrameAverageLightLevel = hdrMetadata.maxFrameAverageLightLevel;
 
-        m_VideoContext->VideoProcessorSetStreamHDRMetaData(
-            m_VideoProcessor.Get(),
-            0,
-            DXGI_HDR_METADATA_TYPE_HDR10,
-            sizeof(DXGI_HDR_METADATA_HDR10),
-            &streamHDRMetaData
-            );
+        if (m_VideoProcessor && m_VideoContext) {
+            m_VideoContext->VideoProcessorSetStreamHDRMetaData(
+                m_VideoProcessor.Get(),
+                0,
+                DXGI_HDR_METADATA_TYPE_HDR10,
+                sizeof(DXGI_HDR_METADATA_HDR10),
+                &streamHDRMetaData
+                );
+        }
+
+        // The direct shader path bypasses the video processor, so publishing
+        // HDR10 metadata only on the VP is insufficient. Attach it to the
+        // swapchain too, allowing DWM/the display driver to map PQ content with
+        // the actual mastering and content-light information.
+        if (m_SwapChain) {
+            HRESULT swapChainHr = m_SwapChain->SetHDRMetaData(
+                DXGI_HDR_METADATA_TYPE_HDR10,
+                sizeof(DXGI_HDR_METADATA_HDR10),
+                &streamHDRMetaData);
+            if (FAILED(swapChainHr)) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "IDXGISwapChain4::SetHDRMetaData(HDR10) failed: %x",
+                            swapChainHr);
+            }
+        }
 
         streamSet = true;
     }
+    else {
+        clearHdrMetadata();
+    }
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Set stream HDR mode: %s", streamSet ? "enabled" : "disabled");
+
+    // Swapchain metadata is also used by the direct shader path. Everything
+    // below is video-processor-specific and can be skipped when VP creation
+    // failed without disabling the renderer.
+    if (!m_VideoProcessor || !m_VideoContext) {
+        return;
+    }
+
+    // The display may have changed since the last call. Clear the previous
+    // output metadata before probing so lookup failures cannot retain it.
+    clearVideoProcessorOutputHdrMetadata();
 
     // Prepare HDR Meta Data to match the monitor HDR specifications
     int appAdapterIndex = 0;

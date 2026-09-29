@@ -1,4 +1,5 @@
 #include "streaming/session.h"
+#include "streaming/audio/dualsensehapticsrouting.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -34,6 +35,57 @@ const int SdlInputHandler::k_ButtonMap[] = {
     TOUCHPAD_FLAG,
 };
 
+int SdlInputHandler::getNativeDualSenseControllerNumber() const
+{
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    dualsense_haptics::LocalControllerCandidate controllers[MAX_GAMEPADS];
+    std::size_t controllerCount = 0;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (m_GamepadState[i].controller == nullptr) {
+            continue;
+        }
+        controllers[controllerCount++] = {
+            m_GamepadState[i].index,
+            SDL_GameControllerGetType(m_GamepadState[i].controller) == SDL_CONTROLLER_TYPE_PS5,
+        };
+    }
+
+    return dualsense_haptics::selectUniqueLocalDualSense(
+        controllers, controllerCount, m_MultiController);
+#else
+    return -1;
+#endif
+}
+
+GamepadUiStyle SdlInputHandler::getGamepadUiStyle() const
+{
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (m_GamepadState[i].controller != nullptr) {
+            switch (m_GamepadState[i].type) {
+            case LI_CTYPE_PS:
+                return GamepadUiStylePlayStation;
+            case LI_CTYPE_NINTENDO:
+                return GamepadUiStyleNintendo;
+            default:
+                return GamepadUiStyleXbox;
+            }
+        }
+    }
+#endif
+    return GamepadUiStyleXbox;
+}
+
+bool SdlInputHandler::hasConnectedGamepads() const
+{
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (m_GamepadState[i].controller != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 GamepadState*
 SdlInputHandler::findStateForGamepad(SDL_JoystickID id)
 {
@@ -49,6 +101,61 @@ SdlInputHandler::findStateForGamepad(SDL_JoystickID id)
     // We can get a spurious removal event if the device is removed
     // before or during SDL_GameControllerOpen(). This is fine to ignore.
     return nullptr;
+}
+
+// Emulated mouse-button bindings, shared by the press/release paths in
+// handleControllerButtonEvent and the teardown release. The flags are
+// tracked per gamepad in GamepadState::mouseEmulationButtonsHeld.
+enum
+{
+    k_EmbLeft = 1 << 0,
+    k_EmbRight = 1 << 1,
+    k_EmbMiddle = 1 << 2,
+    k_EmbX1 = 1 << 3,
+    k_EmbX2 = 1 << 4,
+};
+
+static const struct MouseEmulationBinding
+{
+    unsigned char controllerButton;
+    int flag;
+    unsigned short mouseButton;
+} k_MouseEmulationButtons[] = {
+    { SDL_CONTROLLER_BUTTON_A, k_EmbLeft, BUTTON_LEFT },
+    { SDL_CONTROLLER_BUTTON_B, k_EmbRight, BUTTON_RIGHT },
+    { SDL_CONTROLLER_BUTTON_X, k_EmbMiddle, BUTTON_MIDDLE },
+    { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, k_EmbX1, BUTTON_X1 },
+    { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, k_EmbX2, BUTTON_X2 },
+};
+
+// Radial deadzone: zero out small deflections and rescale the rest
+// linearly, so crossing the deadzone edge doesn't cause a sudden jump.
+// Applied to the values being sent, never to the stored stick state,
+// so it can't compound across multiple sends.
+static void applyRadialDeadzone(short* x, short* y, int deadzonePercent)
+{
+    if (deadzonePercent <= 0) {
+        return;
+    }
+
+    qint64 ix = *x;
+    qint64 iy = *y;
+    qint64 magnitude = (qint64)qSqrt((double)(ix * ix + iy * iy));
+    qint64 deadzone = 32767LL * deadzonePercent / 100;
+
+    if (magnitude <= deadzone) {
+        *x = 0;
+        *y = 0;
+        return;
+    }
+
+    qint64 scaled = (magnitude - deadzone) * 32767LL / (32767LL - deadzone);
+    if (scaled > 32767) {
+        scaled = 32767;
+    }
+
+    *x = (short)(scaled * ix / magnitude);
+    *y = (short)(scaled * iy / magnitude);
 }
 
 void SdlInputHandler::sendGamepadState(GamepadState* state)
@@ -100,6 +207,9 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
             }
         }
     }
+
+    applyRadialDeadzone(&lsX, &lsY, m_GamepadDeadzone);
+    applyRadialDeadzone(&rsX, &rsY, m_GamepadDeadzone);
 
     LiSendMultiControllerEvent(state->index,
                                m_GamepadMask,
@@ -153,21 +263,46 @@ void SdlInputHandler::sendGamepadBatteryState(GamepadState* state, SDL_JoystickP
     LiSendControllerBatteryEvent(state->index, batteryState, batteryPercentage);
 }
 
+void SdlInputHandler::sendGamepadArrival(GamepadState* state,
+                                         SDL_JoystickPowerLevel powerLevel)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    LiSendControllerArrivalEvent(state->index, m_GamepadMask, state->type,
+                                 state->supportedButtonFlags, state->capabilities);
+#else
+    sendGamepadState(state);
+#endif
+
+    if (powerLevel != SDL_JOYSTICK_POWER_UNKNOWN) {
+        sendGamepadBatteryState(state, powerLevel);
+    }
+}
+
 Uint32 SdlInputHandler::mouseEmulationTimerCallback(Uint32 interval, void *param)
 {
+    // NB: This runs on SDL's timer thread and reads stick values written by
+    // the main thread without synchronization. The race is inherited from the
+    // upstream design and tolerated: aligned 16-bit reads don't tear in
+    // practice, and a stale sample costs at most one 50 ms tick of latency.
     auto gamepad = reinterpret_cast<GamepadState*>(param);
 
     int rawX;
     int rawY;
 
+    short lsX = gamepad->lsX;
+    short lsY = gamepad->lsY;
+    short rsX = gamepad->rsX;
+    short rsY = gamepad->rsY;
+    applyRadialDeadzone(&lsX, &lsY, gamepad->mouseEmulationDeadzonePercent);
+    applyRadialDeadzone(&rsX, &rsY, gamepad->mouseEmulationDeadzonePercent);
+
     // Determine which analog stick is currently receiving the strongest input
-    if (abs(gamepad->lsX) + abs(gamepad->lsY) > abs(gamepad->rsX) + abs(gamepad->rsY)) {
-        rawX = gamepad->lsX;
-        rawY = -gamepad->lsY;
-    }
-    else {
-        rawX = gamepad->rsX;
-        rawY = -gamepad->rsY;
+    if (abs(lsX) + abs(lsY) > abs(rsX) + abs(rsY)) {
+        rawX = lsX;
+        rawY = -lsY;
+    } else {
+        rawX = rsX;
+        rawY = -rsY;
     }
 
     float deltaX;
@@ -290,31 +425,21 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
             state->lastStartDownTime = SDL_GetTicks();
         }
         else if (state->mouseEmulationTimer != 0) {
-            if (event->button == SDL_CONTROLLER_BUTTON_A) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
+            for (const auto& binding : k_MouseEmulationButtons) {
+                if (event->button == binding.controllerButton) {
+                    LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, binding.mouseButton);
+                    state->mouseEmulationButtonsHeld |= binding.flag;
+                    break;
+                }
             }
-            else if (event->button == SDL_CONTROLLER_BUTTON_B) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_RIGHT);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_X) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_MIDDLE);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_X1);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_X2);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+
+            if (event->button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
                 LiSendScrollEvent(1);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+            } else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
                 LiSendScrollEvent(-1);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
+            } else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
                 LiSendHScrollEvent(1);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_LEFT) {
+            } else if (event->button == SDL_CONTROLLER_BUTTON_DPAD_LEFT) {
                 LiSendHScrollEvent(-1);
             }
         }
@@ -327,6 +452,7 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
                 if (state->mouseEmulationTimer != 0) {
                     SDL_RemoveTimer(state->mouseEmulationTimer);
                     state->mouseEmulationTimer = 0;
+                    releaseMouseEmulationButtons(state);
 
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "Mouse emulation deactivated");
@@ -336,6 +462,7 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
                     // Send the start button up event to the host, since we won't do it below
                     sendGamepadState(state);
 
+                    state->mouseEmulationDeadzonePercent = m_GamepadDeadzone;
                     state->mouseEmulationTimer = SDL_AddTimer(MOUSE_EMULATION_POLLING_INTERVAL, SdlInputHandler::mouseEmulationTimerCallback, state);
 
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -349,31 +476,23 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
             }
         }
         else if (state->mouseEmulationTimer != 0) {
-            if (event->button == SDL_CONTROLLER_BUTTON_A) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_B) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_X) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_MIDDLE);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_X1);
-            }
-            else if (event->button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-                LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_X2);
+            for (const auto& binding : k_MouseEmulationButtons) {
+                if (event->button == binding.controllerButton) {
+                    state->mouseEmulationButtonsHeld &= ~binding.flag;
+                    // 另一只手柄的会话仍按着同一个键时,不能替它松开
+                    if (!anotherSessionOwnsEmulatedButton(state, binding.flag)) {
+                        LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, binding.mouseButton);
+                    }
+                    break;
+                }
             }
         }
     }
 
     // Handle configurable gamepad quit combo
-    if (qgetenv("NO_GAMEPAD_QUIT") != "1") {
+    if (m_GamepadQuitEnabled) {
         int quitComboMask;
         switch (m_GamepadQuitCombo) {
-        case StreamingPreferences::GQC_SELECT_L1_R1_X:
-            quitComboMask = BACK_FLAG | LB_FLAG | RB_FLAG | X_FLAG;
-            break;
         case StreamingPreferences::GQC_SELECT_L1_R1_Y:
             quitComboMask = BACK_FLAG | LB_FLAG | RB_FLAG | Y_FLAG;
             break;
@@ -396,35 +515,48 @@ void SdlInputHandler::handleControllerButtonEvent(SDL_ControllerButtonEvent* eve
         }
 
         if (state->buttons == quitComboMask) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Detected quit gamepad button combo");
+            if (!state->quitComboLatched) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Detected quit gamepad button combo");
 
-            // Push a quit event to the main loop
-            SDL_Event event;
-            event.type = SDL_QUIT;
-            event.quit.timestamp = SDL_GetTicks();
-            SDL_PushEvent(&event);
+                // Push a quit event to the main loop
+                SDL_Event event;
+                event.type = SDL_QUIT;
+                event.quit.timestamp = SDL_GetTicks();
+                SDL_PushEvent(&event);
 
-            // Clear buttons down on this gamepad
-            LiSendMultiControllerEvent(state->index, m_GamepadMask,
-                                       0, 0, 0, 0, 0, 0, 0);
+                // Clear buttons down on this gamepad
+                LiSendMultiControllerEvent(state->index, m_GamepadMask, 0, 0, 0, 0, 0, 0, 0);
+                state->quitComboLatched = true;
+            }
             return;
+        }
+        // Edge detection: fire once per press. Re-arm only when one of the
+        // combo's own buttons is released, so pressing and releasing extra
+        // buttons while holding the combo doesn't fire it again.
+        if ((state->buttons & quitComboMask) != quitComboMask) {
+            state->quitComboLatched = false;
         }
     }
 
     // Handle Select+L1+R1+X as a gamepad overlay combo
-    if (state->buttons == (BACK_FLAG | LB_FLAG | RB_FLAG | X_FLAG)) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Detected stats toggle gamepad combo");
+    const int statsComboMask = BACK_FLAG | LB_FLAG | RB_FLAG | X_FLAG;
+    if (state->buttons == statsComboMask) {
+        if (!state->statsComboLatched) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Detected stats toggle gamepad combo");
 
-        // Toggle the stats overlay
-        Session::get()->getOverlayManager().setOverlayState(Overlay::OverlayDebug,
-                                                            !Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug));
+            // Toggle the stats overlay
+            Session::get()->getOverlayManager().setOverlayState(
+                Overlay::OverlayDebug,
+                !Session::get()->getOverlayManager().isOverlayEnabled(Overlay::OverlayDebug));
 
-        // Clear buttons down on this gamepad
-        LiSendMultiControllerEvent(state->index, m_GamepadMask,
-                                   0, 0, 0, 0, 0, 0, 0);
+            // Clear buttons down on this gamepad
+            LiSendMultiControllerEvent(state->index, m_GamepadMask, 0, 0, 0, 0, 0, 0, 0);
+            state->statsComboLatched = true;
+        }
         return;
+    }
+    if ((state->buttons & statsComboMask) != statsComboMask) {
+        state->statsComboLatched = false;
     }
 
     // Only send the gamepad state to the host if it's not in mouse emulation mode
@@ -513,7 +645,7 @@ void SdlInputHandler::handleJoystickBatteryEvent(SDL_JoyBatteryEvent* event)
 
 #endif
 
-void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* event)
+void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* event, bool notifyHost)
 {
     GamepadState* state;
 
@@ -598,6 +730,10 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
 
         state->controller = controller;
         state->jsId = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(state->controller));
+        // The slot is not zeroed on add; anything the event paths rely on
+        // being false must be initialized here
+        state->quitComboLatched = false;
+        state->statsComboLatched = false;
 
         hapticCaps = 0;
 #if SDL_VERSION_ATLEAST(2, 0, 18)
@@ -712,6 +848,12 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
         if (SDL_GameControllerHasLED(state->controller)) {
             capabilities |= LI_CCAP_RGB_LED;
         }
+#ifdef Q_OS_WIN32
+        if (m_EnableDualSenseHaptics &&
+            SDL_GameControllerGetType(state->controller) == SDL_CONTROLLER_TYPE_PS5) {
+            capabilities |= LI_CCAP_DS5_HAPTICS_PCM;
+        }
+#endif
 
         uint8_t type;
         switch (SDL_GameControllerGetType(state->controller)) {
@@ -733,7 +875,32 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
             type = LI_CTYPE_NINTENDO;
             break;
         default:
-            type = LI_CTYPE_UNKNOWN;
+            // These Steam Controller VID/PID combos come from SDL's controller_list.h
+            // TODO: Use SDL_GAMEPAD_TYPE_STEAM on SDL 3.6+
+            if (vendorId == 0x28de) {
+                switch (productId) {
+                case 0x1101:
+                case 0x1102:
+                case 0x1105:
+                case 0x1106:
+                case 0x1142:
+                case 0x1201:
+                case 0x1202:
+                case 0x1205:
+                case 0x1302:
+                case 0x1303:
+                case 0x1304:
+                case 0x1305:
+                    type = LI_CTYPE_STEAM;
+                    break;
+                default:
+                    type = LI_CTYPE_UNKNOWN;
+                    break;
+                }
+            }
+            else {
+                type = LI_CTYPE_UNKNOWN;
+            }
             break;
         }
 
@@ -745,16 +912,13 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
 #endif
             type == LI_CTYPE_PS;
 
-        LiSendControllerArrivalEvent(state->index, m_GamepadMask, type, supportedButtonFlags, capabilities);
-#else
-
-        // Send an empty event to tell the PC we've arrived
-        sendGamepadState(state);
+        state->supportedButtonFlags = supportedButtonFlags;
+        state->capabilities = capabilities;
+        state->type = type;
 #endif
 
-        // Send a power level if it's known at this time
-        if (powerLevel != SDL_JOYSTICK_POWER_UNKNOWN) {
-            sendGamepadBatteryState(state, powerLevel);
+        if (notifyHost) {
+            sendGamepadArrival(state, powerLevel);
         }
     }
     else if (event->type == SDL_CONTROLLERDEVICEREMOVED) {
@@ -763,6 +927,8 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
             if (state->mouseEmulationTimer != 0) {
                 Session::get()->notifyMouseEmulationMode(false);
                 SDL_RemoveTimer(state->mouseEmulationTimer);
+                state->mouseEmulationTimer = 0;
+                releaseMouseEmulationButtons(state);
             }
 
             SDL_GameControllerClose(state->controller);
@@ -787,12 +953,37 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
                         state->index);
 
             // Send a final event to let the PC know this gamepad is gone
-            LiSendMultiControllerEvent(state->index, m_GamepadMask,
-                                       0, 0, 0, 0, 0, 0, 0);
+            if (notifyHost) {
+                LiSendMultiControllerEvent(state->index, m_GamepadMask,
+                                           0, 0, 0, 0, 0, 0, 0);
+            }
 
             // Clear all remaining state from this slot
             SDL_memset(state, 0, sizeof(*state));
         }
+    }
+}
+
+void SdlInputHandler::notifyHostOfConnectedGamepads()
+{
+    bool hasConnectedGamepad = false;
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        GamepadState* state = &m_GamepadState[i];
+        if (state->controller == nullptr) {
+            continue;
+        }
+
+        hasConnectedGamepad = true;
+
+        const SDL_JoystickPowerLevel powerLevel =
+            SDL_JoystickCurrentPowerLevel(SDL_GameControllerGetJoystick(state->controller));
+        sendGamepadArrival(state, powerLevel);
+    }
+
+    // A reconnect can race with removal of the final controller. Send an empty
+    // state so the host observes the current mask even when there is no arrival.
+    if (!hasConnectedGamepad) {
+        LiSendMultiControllerEvent(0, m_GamepadMask, 0, 0, 0, 0, 0, 0, 0);
     }
 }
 
@@ -897,6 +1088,17 @@ void SdlInputHandler::rumbleTriggers(uint16_t controllerNumber, uint16_t leftTri
 #endif
 }
 
+void SdlInputHandler::stopAllRumble()
+{
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        if (m_GamepadState[i].controller == nullptr) {
+            continue;
+        }
+        rumble(i, 0, 0);
+        rumbleTriggers(i, 0, 0);
+    }
+}
+
 void SdlInputHandler::setMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz)
 {
     // Make sure the controller number is within our supported count
@@ -940,13 +1142,19 @@ void SdlInputHandler::setControllerLED(uint16_t controllerNumber, uint8_t r, uin
 void SdlInputHandler::setAdaptiveTriggers(uint16_t controllerNumber, DualSenseOutputReport *report){
 
 #if SDL_VERSION_ATLEAST(2, 0, 16)
-        // Make sure the controller number is within our supported count
-    if (controllerNumber <= MAX_GAMEPADS &&
+    // Make sure the controller number is within our supported count
+    if (report != nullptr &&
+        controllerNumber < MAX_GAMEPADS &&
         // and we have a valid controller
         m_GamepadState[controllerNumber].controller != nullptr &&
         // and it's a PS5 controller
         SDL_GameControllerGetType(m_GamepadState[controllerNumber].controller) == SDL_CONTROLLER_TYPE_PS5) {
-        SDL_GameControllerSendEffect(m_GamepadState[controllerNumber].controller, report, sizeof(*report));
+        if (SDL_GameControllerSendEffect(m_GamepadState[controllerNumber].controller,
+                                         report, sizeof(*report)) < 0) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_INPUT,
+                        "Unable to send DualSense adaptive trigger effect: %s",
+                        SDL_GetError());
+        }
     }
 #endif
 
@@ -1044,6 +1252,39 @@ int SdlInputHandler::getAttachedGamepadMask()
     return mask;
 }
 
+bool SdlInputHandler::anotherSessionOwnsEmulatedButton(const GamepadState* state, int flag) const
+{
+    for (int i = 0; i < MAX_GAMEPADS; i++) {
+        const GamepadState* other = &m_GamepadState[i];
+        if (other != state && other->controller != nullptr && other->mouseEmulationTimer != 0 &&
+            (other->mouseEmulationButtonsHeld & flag)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SdlInputHandler::releaseMouseEmulationButtons(GamepadState* state)
+{
+    // Emulation can end (hot-unplug, long-press/menu deactivation) while
+    // emulation mouse buttons are still held. The normal release path in
+    // handleControllerButtonEvent only runs while the timer is live, so
+    // release what this session owns here. In multi-controller mode the
+    // active session of another gamepad may share a host button; leave
+    // those untouched.
+    for (const auto& binding : k_MouseEmulationButtons) {
+        if (!(state->mouseEmulationButtonsHeld & binding.flag)) {
+            continue;
+        }
+
+        if (!anotherSessionOwnsEmulatedButton(state, binding.flag)) {
+            LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, binding.mouseButton);
+        }
+    }
+
+    state->mouseEmulationButtonsHeld = 0;
+}
+
 bool SdlInputHandler::toggleGamepadMouseEmulation()
 {
     // Find the first active gamepad and toggle its mouse emulation
@@ -1054,6 +1295,7 @@ bool SdlInputHandler::toggleGamepadMouseEmulation()
                 // Deactivate
                 SDL_RemoveTimer(state->mouseEmulationTimer);
                 state->mouseEmulationTimer = 0;
+                releaseMouseEmulationButtons(state);
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                             "Mouse emulation deactivated (via menu)");
                 Session::get()->notifyMouseEmulationMode(false);
@@ -1061,6 +1303,7 @@ bool SdlInputHandler::toggleGamepadMouseEmulation()
             } else {
                 // Activate
                 sendGamepadState(state);
+                state->mouseEmulationDeadzonePercent = m_GamepadDeadzone;
                 state->mouseEmulationTimer = SDL_AddTimer(
                     MOUSE_EMULATION_POLLING_INTERVAL,
                     SdlInputHandler::mouseEmulationTimerCallback, state);

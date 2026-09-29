@@ -1,10 +1,14 @@
 #pragma once
 
 #include <QSemaphore>
+#include <QPoint>
+#include <QJsonArray>
 #include <QQuickWindow>
 
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <optional>
 
 #include <Limelight.h>
 #include <opus_multistream.h>
@@ -15,9 +19,23 @@
 #include "video/overlaymanager.h"
 #include "video/overlaymenupanel.h"
 #include "video/overlaymenubutton.h"
+#include "backend/usbforwardingtunnel.h"
 #include "video/overlaytoast.h"
 #ifndef STEAM_LINK
 #include "micstream.h"
+#endif
+
+namespace FileMappingUx {
+struct ProbeState;
+struct MountState;
+}
+
+class DualSenseHapticsRenderer;
+#ifdef Q_OS_DARWIN
+class MacQtEventPumpInputGuard;
+#endif
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+class StylusReplayTest;
 #endif
 
 class SupportedVideoFormatList : public QList<int>
@@ -107,7 +125,11 @@ class Session : public QObject
     friend class AsyncConnectionStartThread;
 
 public:
-    explicit Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences = nullptr);
+    explicit Session(NvComputer* computer,
+                     NvApp& app,
+                     StreamingPreferences *preferences = nullptr,
+                     QString launchDisplayName = QString(),
+                     std::optional<bool> launchUseVdd = std::nullopt);
     virtual ~Session();
 
     Q_INVOKABLE bool initialize(QQuickWindow* qtWindow);
@@ -161,6 +183,10 @@ private:
     // unexpected network interruption. Returns true if streaming resumed.
     bool tryReconnect();
 
+    void handleSdlUserEvent(const SDL_UserEvent& event);
+
+    void updateDualSenseHapticsControllerTarget();
+
     // Emit the appropriate error dialog for a connection termination code.
     void displayTerminationError(int errorCode);
 
@@ -184,17 +210,37 @@ private:
     void toggleFullscreen();
 
     // Qt-based overlay menu
-    void showQtOverlayMenu();
+    void showQtOverlayMenu(std::optional<QPoint> pointerGlobalPosition = std::nullopt,
+                           bool closeWhenPointerOutside = true);
     void hideQtOverlayMenu();
     void toggleQtOverlayMenu();
+    bool isStreamingWindowVisible() const;
+    void syncQtOverlayWindowsWithSdlWindowState();
     void dispatchQtMenuAction(OverlayMenuPanel::MenuAction action);
     void requestRuntimeBitrateChange(int bitrateKbps);
+    void startRuntimeBitrateWorker();
     void showStreamingToast(const QString& message, int durationMs = 2000);
+    void processQtOverlayEvents();
+    void updateFileMappingMenuState();
+    void updateRemoteUsbMenuState();
+    bool openFileMappingMountPath();
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+    void restoreCaptureAfterStylusReplayPanel();
+#endif
 #ifdef Q_OS_WIN32
-    void queryDisplayHdrBrightness(float& maxNits, float& minNits, float& maxFullNits);
+    void queryDisplayHdrBrightness(const QString& preferredDisplayName,
+                                   float& maxNits, float& minNits,
+                                   float& maxFullNits, float& sdrWhiteNits);
+    float queryDisplaySdrWhiteNits(const QString& displayName, bool logFailures = true);
 #endif
 
     void notifyMouseEmulationMode(bool enabled);
+
+    static
+    bool queueTouchpadFrameFlush();
+
+    static
+    bool queueCursorVisibilityFlush();
 
     void updateOptimalWindowDisplayMode();
 
@@ -211,6 +257,7 @@ private:
 
     static
     bool chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
+                       StreamingPreferences::RendererSelection renderer,
                        SDL_Window* window, int videoFormat, int width, int height,
                        int frameRate, bool enableVsync, bool enableFramePacing,
                        bool enableVideoEnhancement, bool ignoreAspectRatio, bool testOnly,
@@ -235,7 +282,7 @@ private:
     void clConnectionStatusUpdate(int connectionStatus);
 
     static
-    void clSetHdrMode(bool enabled);
+    void clSetHdrMode(bool enabled, void* hdrMetadata);
 
     static
     void clRumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger, uint16_t rightTrigger);
@@ -251,6 +298,15 @@ private:
 
     static
     void clClipboardData(const char* data, int length);
+
+    static
+    void clCursorUpdate(const LI_CURSOR_UPDATE* update);
+
+    static
+    void clDs5HapticsPcm(const LI_DS5_HAPTICS_PCM_FRAME* frame);
+
+    static
+    void clDs5HapticsIrV2(const LI_DS5_HAPTICS_IR_FRAME_V2* frame);
 
     static
     int arInit(int audioConfiguration,
@@ -275,6 +331,18 @@ private:
     void startSunshineAbr();
     void stopSunshineAbr();
     void sendSunshineAbrFeedback();
+    void startFileMappingUxProbe();
+    void processFileMappingUxProbeResult();
+    void startFileMappingMount();
+    void processFileMappingMountResult();
+    void cleanupFileMappingMount();
+    void startFileMappingSmokeProbe();
+    void refreshRemoteUsbDevices();
+    void enumerateRemoteUsb();
+    void startRemoteUsb(const QString &deviceId);
+    void startConfiguredRemoteUsb(UsbForwarding::TunnelConfig config);
+    void stopRemoteUsb();
+    void teardownUsbTunnel();
 
     static
     int drSubmitDecodeUnit(PDECODE_UNIT du);
@@ -287,6 +355,9 @@ private:
     AUDIO_RENDERER_CALLBACKS m_AudioCallbacks;
     NvComputer* m_Computer;
     NvApp m_App;
+    QString m_LaunchDisplayName;
+    QString m_ClientDisplayName;
+    std::optional<bool> m_LaunchUseVdd;
     SDL_Window* m_Window;
     IVideoDecoder* m_VideoDecoder;
     SDL_mutex* m_DecoderLock;
@@ -304,9 +375,11 @@ private:
     // Graceful reconnect state
     bool m_ConnectionInterrupted;        // set by clConnectionTerminated for recoverable errors
     bool m_SuppressConnectionErrorDialog; // suppress error dialogs during reconnect attempts
+    bool m_HasReceivedVideo;             // true after the first decode unit of the current connection
     int m_LastTerminationErrorCode;      // stored to show final error if reconnect gives up
 
     bool m_AsyncConnectionSuccess;
+    float m_LastClientSdrWhiteNits;
     int m_PortTestResults;
 
     int m_ActiveVideoFormat;
@@ -316,6 +389,7 @@ private:
 
     OpusMSDecoder* m_OpusDecoder;
     IAudioRenderer* m_AudioRenderer;
+    DualSenseHapticsRenderer* m_DualSenseHapticsRenderer;
     OPUS_MULTISTREAM_CONFIGURATION m_ActiveAudioConfig;
     OPUS_MULTISTREAM_CONFIGURATION m_OriginalAudioConfig;
     int m_AudioSampleCount;
@@ -325,16 +399,57 @@ private:
     bool m_WasCapturedBeforeMenu;  // 菜单打开前鼠标是否处于捕获状态
     bool m_DeferCaptureRestore;    // 延迟恢复鼠标捕获（全屏切换等）
     bool m_PendingMicToggle;       // 延迟麦克风切换（避免堆损坏）
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+    // Developer-only test harness. All replay/UI behavior lives behind this
+    // boundary so production Session code keeps only integration hooks.
+    std::unique_ptr<StylusReplayTest> m_StylusReplayTest;
+    bool m_WasCapturedBeforeStylusReplayPanel;
+#endif
     bool m_SunshineAbrEnabled;
     Uint32 m_LastAbrFeedbackTicks;
     RTP_VIDEO_STATS m_LastAbrVideoStats;
     std::shared_ptr<std::atomic_bool> m_AbrFeedbackInFlight;
     std::shared_ptr<std::atomic_int> m_AbrCurrentBitrateKbps;
+    // Runtime bitrate requests coalesce here; a single background worker
+    // applies the newest value so HTTP never blocks the stream loop.
+    std::atomic_int m_PendingRuntimeBitrateKbps { 0 };
+    std::atomic_bool m_RuntimeBitrateInFlight { false };
     OverlayMenuPanel* m_MenuPanel; // Qt-based overlay menu window
     OverlayMenuButton* m_MenuButton; // Qt-based floating menu button
     OverlayToast* m_Toast;           // Qt-based toast notification
+#ifdef Q_OS_DARWIN
+    std::unique_ptr<MacQtEventPumpInputGuard> m_MacQtEventPumpInputGuard;
+#endif
+    OverlayMenuPanel::FileMappingState m_FileMappingState;
+    QString m_FileMappingDetail;
+    QString m_FileMappingToast;
+    bool m_FileMappingToastPending;
+    std::shared_ptr<FileMappingUx::ProbeState> m_FileMappingProbeState;
+    std::shared_ptr<FileMappingUx::MountState> m_FileMappingMountState;
+    QString m_FileMappingMountPath;
+    QString m_FileMappingSessionId;
     Uint32 m_MenuCloseTicks;       // 菜单关闭时间戳（防抖）
-    class ClipboardSync* m_ClipboardSync; // Bidirectional clipboard sync (Sunshine 0x5508); nullptr when stream not active
+    void stopClipboardHelper();
+    std::mutex m_ClipboardHelperMutex;
+    class ClipboardHelperClient*
+        m_ClipboardHelper; // Protected from receive callbacks by m_ClipboardHelperMutex
+    std::mutex m_CursorUpdateMutex;
+    std::shared_ptr<RemoteCursorUpdate> m_PendingCursorUpdate;
+    bool m_CursorUpdateEventQueued = false;
+    /* USB forwarding: one reverse tunnel per forwarded device, owned by this
+     * session. m_RemoteUsbDevices mirrors the bound-device list from
+     * UsbForwardingBackend and feeds the overlay menu. On macOS the local
+     * USB/IP server (moonlight-usbd serve) is spawned per session and torn
+     * down together with the tunnel. */
+    UsbForwarding::Tunnel *m_UsbTunnel = nullptr;
+    class UsbForwardingLocalServer* m_UsbLocalServer = nullptr;
+    quint64 m_UsbCapabilityGeneration = 0;
+    bool m_UsbCapabilityPending = false;
+    std::vector<OverlayMenuPanel::RemoteUsbDevice> m_RemoteUsbDevices;
+    OverlayMenuPanel::RemoteUsbState m_RemoteUsbState =
+        OverlayMenuPanel::RemoteUsbState::Unavailable;
+    QString m_RemoteUsbActiveDeviceId;
+    QString m_RemoteUsbDetail;
 
     static CONNECTION_LISTENER_CALLBACKS k_ConnCallbacks;
     static Session* s_ActiveSession;

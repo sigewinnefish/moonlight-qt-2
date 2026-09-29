@@ -67,6 +67,7 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
 
         // Toggle mouse mode
         m_AbsoluteMouseMode = !m_AbsoluteMouseMode;
+        synchronizeLocalCursorMode();
 
         // Recapture input
         setCaptureActive(true);
@@ -79,7 +80,8 @@ void SdlInputHandler::performSpecialKeyCombo(KeyCombo combo)
         if (!SDL_GetRelativeMouseMode()) {
             // 切换本地鼠标光标可见性状态
             m_MouseCursorCapturedVisibilityState = !m_MouseCursorCapturedVisibilityState;
-            SDL_ShowCursor(m_MouseCursorCapturedVisibilityState);
+            synchronizeLocalCursorMode();
+            applyCapturedCursorState();
         }
         else {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
@@ -473,9 +475,30 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
         m_KeysDown.remove(keyCode);
     }
 
-    LiSendKeyboardEvent2(0x8000 | keyCode,
-                        event->state == SDL_PRESSED ?
-                            KEY_ACTION_DOWN : KEY_ACTION_UP,
-                        modifiers,
-                        shouldNotConvertToScanCodeOnServer ? SS_KBE_FLAG_NON_NORMALIZED : 0);
+    const char keyAction = event->state == SDL_PRESSED ? KEY_ACTION_DOWN : KEY_ACTION_UP;
+    const char flags = shouldNotConvertToScanCodeOnServer ? SS_KBE_FLAG_NON_NORMALIZED : 0;
+
+    SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
+                 "Keyboard %s: scancode=%d sym=%d vk=0x%04x modifiers=0x%02x flags=0x%02x keysDown=%d",
+                 event->state == SDL_PRESSED ? "down" : "up",
+                 (int)event->keysym.scancode,
+                 (int)event->keysym.sym,
+                 (int)(0x8000 | keyCode),
+                 (int)(unsigned char)modifiers,
+                 (int)(unsigned char)flags,
+                 (int)m_KeysDown.count());
+
+    int rc = LiSendKeyboardEvent2(0x8000 | keyCode,
+                                  keyAction,
+                                  modifiers,
+                                  flags);
+    if (rc != 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "LiSendKeyboardEvent2 failed: rc=%d action=%s scancode=%d vk=0x%04x keysDown=%d",
+                    rc,
+                    keyAction == KEY_ACTION_DOWN ? "down" : "up",
+                    (int)event->keysym.scancode,
+                    (int)(0x8000 | keyCode),
+                    (int)m_KeysDown.count());
+    }
 }

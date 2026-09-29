@@ -61,7 +61,8 @@ mkdir %BUILD_FOLDER%
 mkdir %INSTALLER_FOLDER%
 
 rem Find Visual Studio and run vcvarsall.bat
-set VSWHERE="%SOURCE_ROOT%\scripts\vswhere.exe"
+call "%SOURCE_ROOT%\scripts\find-vswhere.bat"
+if !ERRORLEVEL! NEQ 0 goto Error
 for /f "usebackq delims=" %%i in (`%VSWHERE% -latest -property installationPath`) do (
     call "%%i\VC\Auxiliary\Build\vcvarsall.bat" x86
 )
@@ -73,9 +74,15 @@ cmd /c "set VERSION= && msbuild -Restore %SOURCE_ROOT%\wix\MoonlightSetup\Moonli
 if !ERRORLEVEL! NEQ 0 goto Error
 
 rem Rename the installer to match the publishing convention
-ren %INSTALLER_FOLDER%\MoonlightSetup.exe MoonlightSetup-%VERSION%.exe
+ren %INSTALLER_FOLDER%\MoonlightSetup.exe Moonlight-VPlus-Setup-%VERSION%.exe
+if !ERRORLEVEL! NEQ 0 goto Error
 
-echo Build successful for Moonlight v%VERSION% installer!
+rem Keep one legacy-named alias so installed pre-rebrand clients can find the
+rem first Moonlight V+ release asset.
+copy /Y %INSTALLER_FOLDER%\Moonlight-VPlus-Setup-%VERSION%.exe %INSTALLER_FOLDER%\MoonlightSetup-%VERSION%.exe
+if !ERRORLEVEL! NEQ 0 goto Error
+
+echo Build successful for Moonlight V+ for PC v%VERSION% installer!
 exit /b 0
 
 :Error

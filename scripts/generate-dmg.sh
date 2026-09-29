@@ -67,6 +67,20 @@ pushd $BUILD_FOLDER
 make -j$(sysctl -n hw.logicalcpu) $(echo "$BUILD_CONFIG" | tr '[:upper:]' '[:lower:]') || fail "Make failed!"
 popd
 
+# USB 转发 helper（usbipdcpp + libusb 静态构建，见 usb-helper/README.md）。
+# 独立 build 目录按架构隔离（本脚本可能对不同架构各跑一次，BUILD_ROOT 是共
+# 享的），configure 前清掉防陈旧缓存；主工程的 LTO 环境变量不带给它。
+echo Building USB forwarding helper
+USB_HELPER_BUILD=$BUILD_ROOT/usb-helper-$MOONLIGHT_ARCH
+rm -rf "$USB_HELPER_BUILD"
+(
+  unset CFLAGS CXXFLAGS LDFLAGS
+  cmake -S "$SOURCE_ROOT/usb-helper" -B "$USB_HELPER_BUILD" \
+    -DCMAKE_BUILD_TYPE=$BUILD_CONFIG \
+    -DCMAKE_OSX_ARCHITECTURES=$MOONLIGHT_ARCH || exit 1
+  cmake --build "$USB_HELPER_BUILD" -j$(sysctl -n hw.logicalcpu) || exit 1
+) || fail "USB helper build failed!"
+
 echo Saving dSYM file
 pushd $BUILD_FOLDER
 dsymutil app/Moonlight.app/Contents/MacOS/Moonlight -o Moonlight-$VERSION.dsym || fail "dSYM creation failed!"
@@ -89,7 +103,29 @@ if [ "$GITHUB_ACTIONS" == "true" ]; then
   fi
 fi
 
-macdeployqt $BUILD_FOLDER/app/Moonlight.app $EXTRA_ARGS -qmldir=$SOURCE_ROOT/app/gui -appstore-compliant || fail "macdeployqt failed!"
+echo Copying clipboard helper into app bundle
+HELPER_BINARY=$BUILD_FOLDER/clipboard-helper/moonlight-clipboard-helper
+if [ ! -f "$HELPER_BINARY" ]; then
+  HELPER_BINARY=$BUILD_FOLDER/clipboard-helper/$BUILD_CONFIG/moonlight-clipboard-helper
+fi
+if [ ! -f "$HELPER_BINARY" ]; then
+  HELPER_BINARY=$BUILD_FOLDER/clipboard-helper/$(echo "$BUILD_CONFIG" | tr '[:upper:]' '[:lower:]')/moonlight-clipboard-helper
+fi
+cp "$HELPER_BINARY" $BUILD_FOLDER/app/Moonlight.app/Contents/MacOS/ || fail "Clipboard helper copy failed!"
+
+echo Copying USB forwarding helper into app bundle
+cp "$USB_HELPER_BUILD/moonlight-usbd" $BUILD_FOLDER/app/Moonlight.app/Contents/MacOS/ || fail "USB helper copy failed!"
+
+# macdeployqt only rewrites Qt references in the main executable and the
+# plugins it deploys, so the clipboard helper has to be named explicitly with
+# -executable. Otherwise it keeps the build machine's absolute Qt paths, which
+# either don't exist on the user's machine or pull a second copy of Qt into the
+# process alongside the bundled one. Either way the helper aborts at startup
+# and clipboard sync silently disables itself.
+macdeployqt $BUILD_FOLDER/app/Moonlight.app $EXTRA_ARGS -executable=$BUILD_FOLDER/app/Moonlight.app/Contents/MacOS/moonlight-clipboard-helper -executable=$BUILD_FOLDER/app/Moonlight.app/Contents/MacOS/moonlight-usbd -qmldir=$SOURCE_ROOT/app/gui -appstore-compliant || fail "macdeployqt failed!"
+
+echo Building File Provider extension into app bundle
+bash "$SOURCE_ROOT/scripts/build-macos-fileprovider-extension.sh" "$SOURCE_ROOT" "$BUILD_FOLDER" "$BUILD_FOLDER/app/Moonlight.app" "$MOONLIGHT_ARCH" || fail "File Provider extension build failed"
 
 echo Removing dSYM files from app bundle
 find $BUILD_FOLDER/app/Moonlight.app/ -name '*.dSYM' | xargs rm -rf
@@ -103,26 +139,32 @@ echo Creating DMG
 if [ "$SIGNING_IDENTITY" != "" ]; then
   create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --identity="$SIGNING_IDENTITY" --no-version-in-filename || fail "create-dmg failed!"
 else
-  create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --no-version-in-filename
-  CREATE_DMG_STATUS=$?
-  case $CREATE_DMG_STATUS in
-    0) ;;
-    2) ;;
-    *)
-      echo "create-dmg failed with status $CREATE_DMG_STATUS; falling back to hdiutil"
-      rm -f $INSTALLER_FOLDER/Moonlight.dmg
-      hdiutil create -volname Moonlight -srcfolder $BUILD_FOLDER/app/Moonlight.app -ov -format UDZO $INSTALLER_FOLDER/Moonlight.dmg || fail "fallback hdiutil DMG creation failed!"
-      ;;
-  esac
+  if ! create-dmg "$BUILD_FOLDER/app/Moonlight.app" "$INSTALLER_FOLDER" --no-version-in-filename --no-code-sign; then
+    echo "create-dmg failed; falling back to hdiutil"
+    rm -f "$INSTALLER_FOLDER/Moonlight.dmg"
+    hdiutil create -volname "Moonlight V+" -srcfolder "$BUILD_FOLDER/app/Moonlight.app" -ov -format UDZO "$INSTALLER_FOLDER/Moonlight.dmg" || fail "fallback hdiutil DMG creation failed!"
+  fi
 fi
+
+# create-dmg names the image after CFBundleDisplayName, while the hdiutil
+# fallback uses Moonlight.dmg. The installer directory was cleaned above, so
+# require exactly one generated image and use its real path from here on.
+DMG_CANDIDATES=("$INSTALLER_FOLDER"/*.dmg)
+if [ "${#DMG_CANDIDATES[@]}" -ne 1 ] || [ ! -f "${DMG_CANDIDATES[0]}" ]; then
+  fail "Expected exactly one generated DMG in $INSTALLER_FOLDER"
+fi
+GENERATED_DMG="${DMG_CANDIDATES[0]}"
 
 if [ "$NOTARY_KEYCHAIN_PROFILE" != "" ]; then
   echo Uploading to App Notary service
-  xcrun notarytool submit --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait $INSTALLER_FOLDER/Moonlight.dmg || fail "Notary submission failed"
+  xcrun notarytool submit --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait "$GENERATED_DMG" || fail "Notary submission failed"
 
   echo Stapling notary ticket to DMG
-  xcrun stapler staple -v $INSTALLER_FOLDER/Moonlight.dmg || fail "Notary ticket stapling failed!"
+  xcrun stapler staple -v "$GENERATED_DMG" || fail "Notary ticket stapling failed!"
 fi
 
-mv $INSTALLER_FOLDER/Moonlight.dmg $INSTALLER_FOLDER/Moonlight-$VERSION.dmg
+# 名字里带上架构。这里只出一个架构的包（见上面 MOONLIGHT_ARCH 的注释），叫
+# Moonlight-<版本>.dmg 的话下载的人无法从名字判断能不能装 —— Intel Mac 上装了
+# 才发现打不开。app 侧的更新器也靠这个后缀挑对应架构的资产。
+mv "$GENERATED_DMG" "$INSTALLER_FOLDER/Moonlight-VPlus-$VERSION-$MOONLIGHT_ARCH.dmg"
 echo Build successful

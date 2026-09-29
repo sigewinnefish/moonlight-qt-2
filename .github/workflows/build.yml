@@ -1,4 +1,4 @@
-name: Build Moonlight Qt
+name: Build Moonlight V+ for PC
 
 on:
   workflow_dispatch:
@@ -6,7 +6,6 @@ on:
 permissions:
   contents: write
   packages: write
-  security-events: write
   actions: read
 
 concurrency:
@@ -16,6 +15,109 @@ env:
   BUILD_NUMBER: ${{ github.run_number }}
 
 jobs:
+  qml-lint:
+    # QML 的类型解析失败是运行期致命的，但 qmlcachegen 编得过、四平台构建全绿，
+    # 所以必须单独拦一道（见 scripts/qmllint-check.sh 里的说明）。
+    # 只装 Qt、不构建，和四个 build 并行跑。
+    runs-on: ubuntu-latest
+
+    # 这个 job 会执行 PR 版本里的 scripts/qmllint-check.sh。顶层 permissions 给的是
+    # contents: write，这里收回到只读，并且不把 checkout 的 token 写进本地 git 配置 ——
+    # 否则 PR 作者改一行脚本就能拿着仓库的写权限跑任意命令。
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: '6.11.1'
+        modules: 'qtmultimedia qtimageformats'
+        cache: true
+        aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
+
+    - name: Check QML type resolution
+      run: scripts/qmllint-check.sh
+
+  version-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Test version derivation
+      run: python3 -m unittest discover -s tests/derive_version -p 'test_*.py'
+
+  cpp-format:
+    # C++ 格式门禁:用 git clang-format 只检查相对目标分支**改动过的行**,
+    # 不做全量重排 —— 全量重排会让每次 merge 上游都变成格式冲突灾难。
+    # 与 qml-lint 同理收权到只读,防止 PR 作者借脚本提权。
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Install pinned clang-format
+      run: |
+        # 版本必须钉死:不同 clang-format 版本对同一份 .clang-format 的输出有差异。
+        # 本地请装同一版本(pip install clang-format==21.1.8)再跑 git clang-format。
+        # PyPI 包自带配套的 git-clang-format 驱动,无需另行下载;runner 预装的
+        # /usr/bin/clang-format 版本未知,靠 ~/.local/bin 在 PATH 里靠前来压过它。
+        pipx install clang-format==21.1.8
+        command -v clang-format git-clang-format
+        clang-format --version
+
+    - name: Check formatting of changed lines
+      env:
+        BASE_REF: ${{ github.base_ref }}
+        EVENT_NAME: ${{ github.event_name }}
+        BEFORE: ${{ github.event.before }}
+      run: |
+        # 每种事件的检查基线:
+        #   pull_request -> 与目标分支的 merge-base;
+        #   push         -> 上一提交(weblate 机器人会直推 master,也要拦);
+        #   release/tag dispatch -> merge-base 退化 HEAD(tag 指向的提交在
+        #   master 落地时已被 PR 检查过),自然通过,不再是空转的假 job。
+        if [ -n "$BASE_REF" ]; then
+          BASE=$(git merge-base "origin/$BASE_REF" HEAD)
+        elif [ "$EVENT_NAME" = "push" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+          BASE=$BEFORE
+        else
+          BASE=$(git merge-base origin/master HEAD)
+        fi
+        echo "格式检查基线: $BASE (event=$EVENT_NAME)"
+        # git clang-format --diff 只对 diff 触及的行重排并报告结果,不改工作区。
+        # 无需格式化时输出 "none" / "no modified files to format" 等固定文案。
+        OUTPUT=$(git clang-format --diff --style file --extensions c,cpp,h,mm "$BASE" 2>&1)
+        case "$OUTPUT" in
+          none|*"no modified files to format"|*"clang-format did not modify any files")
+            echo "格式检查通过"
+            ;;
+          *)
+            echo "$OUTPUT"
+            echo "::error::C++ 改动行未通过 clang-format。本地执行 pip install clang-format==21.1.8 后跑 git clang-format 即可自动修复"
+            exit 1
+            ;;
+        esac
+
+
   build-windows:
     runs-on: windows-2022
     steps:
@@ -38,12 +140,14 @@ jobs:
       run: ./setup-deps.ps1
 
     - name: Install Qt
-      uses: jurplel/install-qt-action@v3
+      uses: jdpurcell/install-qt-action@v5
       with:
-        version: '6.8.3'
-        arch: 'win64_msvc2022_64'
+        arch: win64_msvc2022_64
+        host: windows
+        target: desktop
+        version: '6.11.1'
         modules: 'qtmultimedia qtimageformats'
-        cache: true
+        use-naqt: true
 
     - name: Setup build environment
       shell: cmd
@@ -89,20 +193,81 @@ jobs:
       shell: cmd
       run: |
         echo Starting CI-optimized build...
-        
+
         rem Clear any problematic environment variables
         set MAKEFLAGS=
         set _CL_=
-        
+
         rem Build with standard configuration and correct architecture
         echo Building with CI optimizations...
-        scripts\build-arch.bat release x64
-        if !ERRORLEVEL! NEQ 0 (
-          echo Build failed with error !ERRORLEVEL!
-          exit /b !ERRORLEVEL!
-        )
-        
+        call scripts\build-arch.bat release x64
+        if errorlevel 1 exit /b %ERRORLEVEL%
+
         echo Build Windows x64 completed successfully!
+
+    - name: Test input & overlay logic
+      shell: cmd
+      run: |
+        rem 统一入口 scripts\run-test.bat:qmake -> jom release -> 运行,法规约见脚本头注释。
+        rem 新增测试时在这里加一对 call + errorlevel 检查即可。
+        call scripts\run-test.bat ds5_ir_renderer ds5_ir_renderer_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat pen_history_selection pen_history_selection_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat stylus_replay stylus_replay_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat overlay_event_wake_state overlay_event_wake_state
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat overlay_button_native_wake overlay_button_native_wake
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat overlay_toast_event_state overlay_toast_event_state
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        rem overlay_menu_navigation 用 QTest 合成鼠标事件,CI 无桌面会话,必须 offscreen
+        set QT_QPA_PLATFORM=offscreen
+        call scripts\run-test.bat overlay_menu_navigation overlay_menu_navigation
+        if errorlevel 1 exit /b %ERRORLEVEL%
+
+    - name: Test compiled Chinese translations and settings navigation layout
+      shell: cmd
+      run: |
+        rem qmltestrunner 流程与普通测试不同,不走 run-test.bat。
+        lrelease app\languages\qml_zh_CN.ts
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        set QT_QPA_PLATFORM=offscreen
+        qmltestrunner -input tests\settings_localization -translation app\languages\qml_zh_CN.qm
+        if errorlevel 1 exit /b %ERRORLEVEL%
+
+    - name: Test clipboard / cursor / file-mapping / overlay layout logic
+      timeout-minutes: 5
+      shell: cmd
+      run: |
+        rem 剪贴板回归使用 offscreen GUI 和本地 TLS，其余为独立逻辑测试。
+        call scripts\run-test.bat cursor_shape_classification cursor_shape_classification
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat clipboard_payload_routing clipboard_payload_routing
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat clipboard_helper_lifecycle clipboard_helper_lifecycle
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat overlay_button_position overlay_button_position
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat file_mapping_websocket_framing file_mapping_websocket_framing
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat file_mapping_mirror_e2e file_mapping_mirror_e2e
+        if errorlevel 1 exit /b %ERRORLEVEL%
+
+    - name: Test USB forwarding logic
+      shell: cmd
+      run: |
+        call scripts\run-test.bat usb_forwarding_capability usb_forwarding_capability_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat usb_forwarding_environment usb_forwarding_environment_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat usb_forwarding_backend_list usb_forwarding_backend_list_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        call scripts\run-test.bat usb_forwarding_backend_sysfs usb_forwarding_backend_sysfs_test
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        rem usb_forwarding_tunnel 是需要真实 USB/IP 会话的手动联调探针,不进 CI,
+        rem 用法见 tests/README.md。
 
     - name: Install Qt arm64
       uses: jdpurcell/install-qt-action@v5
@@ -111,7 +276,7 @@ jobs:
         dir: ${{ github.workspace }}\arm64\
         host: windows
         target: desktop
-        version: '6.8.3'
+        version: '6.11.1'
         modules: 'qtmultimedia qtimageformats'
         use-naqt: true
 
@@ -124,19 +289,25 @@ jobs:
         rem this, windeployqt would deploy x64 Qt DLLs into the ARM64 portable
         rem package, producing 0xc000007b on launch (qiin2333/moonlight-qt#71).
         set "PATH=%Qt6_DIR%\bin;%PATH%"
-        copy /y scripts\appveyor\qmake.bat %Qt6_DIR%\bin\
-        copy /y scripts\appveyor\qtpaths.bat %Qt6_DIR%\bin\
-        copy /y scripts\appveyor\target_qt.conf %Qt6_DIR%\bin\
-        scripts\build-arch.bat release arm64
-        copy /y build\installer-arm64-release\MoonlightPortable-arm64-$($env:VERSION).zip artifacts\MoonlightPortable-arm64.zip
-        copy /y build\symbols-arm64-Release\MoonlightDebuggingSymbols-arm64-$($env:VERSION).zip artifacts\MoonlightDebuggingSymbols-arm64.zip
+        call scripts\build-arch.bat release arm64
+        if errorlevel 1 exit /b %ERRORLEVEL%
+        for %%f in (build\installer-arm64-release\Moonlight-VPlus-Portable-arm64-*.zip) do powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-pe-machine.ps1 -Path "%%f" -ExpectedMachine 0xAA64
+        if errorlevel 1 exit /b %ERRORLEVEL%
 
     - name: Generate universal installer
       shell: cmd
       run: |
-        scripts\generate-bundle.bat release
+        call scripts\generate-bundle.bat release
+        if errorlevel 1 exit /b %ERRORLEVEL%
 
-    - name: Upload portable artifact
+    - name: Upload portable artifact x64
+      uses: actions/upload-artifact@v4
+      with:
+        name: Moonlight-VPlus-Portable-x64-r${{ env.BUILD_NUMBER }}
+        path: build/installer-x64-release/Moonlight-VPlus-Portable-x64-*.zip
+
+    - name: Upload legacy portable artifact x64
+      if: github.event_name != 'pull_request'
       uses: actions/upload-artifact@v4
       with:
         name: MoonlightPortable-x64-r${{ env.BUILD_NUMBER }}
@@ -145,18 +316,32 @@ jobs:
     - name: Upload portable artifact arm64
       uses: actions/upload-artifact@v4
       with:
+        name: Moonlight-VPlus-Portable-arm64-r${{ env.BUILD_NUMBER }}
+        path: build/installer-arm64-release/Moonlight-VPlus-Portable-arm64-*.zip
+
+    - name: Upload legacy portable artifact arm64
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
         name: MoonlightPortable-arm64-r${{ env.BUILD_NUMBER }}
         path: build/installer-arm64-release/MoonlightPortable-arm64-*.zip
 
     - name: Upload executable artifact
       uses: actions/upload-artifact@v4
       with:
-        name: moonlight-universal-setup-r${{ env.BUILD_NUMBER }}.exe
+        name: Moonlight-VPlus-Setup-r${{ env.BUILD_NUMBER }}.exe
+        path: build/installer-Release/Moonlight-VPlus-Setup-*.exe
+
+    - name: Upload legacy executable artifact
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
+      with:
+        name: MoonlightSetup-r${{ env.BUILD_NUMBER }}.exe
         path: build/installer-Release/MoonlightSetup-*.exe
 
   build-macos:
     runs-on: macos-15
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -178,24 +363,74 @@ jobs:
     - name: Install Qt
       uses: jurplel/install-qt-action@v4
       with:
-        version: '6.11.0'
+        version: '6.11.1'
         modules: 'qtmultimedia qtimageformats'
         cache: true
         aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
+
+    - name: Test macOS overlay event wakeups
+      run: |
+        python3 setup-deps.py
+        pushd tests/overlay_button_native_wake
+        qmake overlay_button_native_wake.pro
+        make -j"$(sysctl -n hw.ncpu)"
+        DYLD_LIBRARY_PATH="$PWD/../../libs/mac/lib" ./overlay_button_native_wake
+        popd
 
     - name: Build and generate DMG
       run: |
         scripts/generate-dmg.sh Release
 
+    - name: Smoke test USB forwarding helper
+      run: |
+        HELPER="build/build-Release/app/Moonlight.app/Contents/MacOS/moonlight-usbd"
+        test -x "$HELPER"
+        # helper 必须静态链 libusb/usbipdcpp：一旦解析到 Homebrew 的
+        # libusb dylib，CI 上能跑、用户机器上必挂。
+        if otool -L "$HELPER" | grep -q "libusb"; then
+          otool -L "$HELPER"
+          echo "helper dynamically links libusb!" >&2
+          exit 1
+        fi
+        "$HELPER" --version
+        "$HELPER" list --json | python3 -c 'import json,sys; d=json.load(sys.stdin); assert isinstance(d, list)'
+
     - name: Upload DMG artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Moonlight-r${{ env.BUILD_NUMBER }}.dmg
-        path: build/installer-Release/Moonlight-*.dmg
+        name: Moonlight-VPlus-r${{ env.BUILD_NUMBER }}.dmg
+        path: build/installer-Release/Moonlight-VPlus-*.dmg
+        if-no-files-found: error
 
   build-linux:
-    runs-on: ubuntu-22.04
-    
+    # x86_64 用标准 runner，aarch64 用 GitHub 的免费 ARM runner（公共仓库可用）。
+    #
+    # 两边的基线故意不一样：x86_64 留在 22.04 把 AppImage 的 glibc 下限压到 2.35，
+    # 而 aarch64 必须上 24.04 —— Qt 官方的 linux_arm64 二进制（含 moc 这些 host 工具）
+    # 是在 glibc 2.38 上编的，放到 jammy 上跑 moc 直接 `GLIBC_2.38 not found`。
+    # 代价是 arm64 的 AppImage 需要 glibc >= 2.39，Debian 12 / RPi OS bookworm 用不了，
+    # 得等 trixie。想再往下压只能自己编 Qt，不值。
+    name: build-linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      APPIMAGE_UPDATE_TAG: ${{ github.event_name == 'release' && github.event.release.prerelease && 'latest-pre' || 'latest' }}
+
+    strategy:
+      # 一边挂了不要连累另一边，方便单独看是哪个架构的问题。
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            qt_host: linux
+            qt_arch: linux_gcc_64
+            multiarch: x86_64-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            qt_host: linux_arm64
+            qt_arch: linux_gcc_arm64
+            multiarch: aarch64-linux-gnu
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -209,10 +444,12 @@ jobs:
         echo "VERSION=$VERSION" >> $GITHUB_ENV
         echo "CI_VERSION=$VERSION" >> $GITHUB_ENV
 
-    - name: Install Qt 6.8.3
-      uses: jurplel/install-qt-action@v3
+    - name: Install Qt 6.11.1
+      uses: jurplel/install-qt-action@v4
       with:
-        version: '6.8.3'
+        version: '6.11.1'
+        host: ${{ matrix.qt_host }}
+        arch: ${{ matrix.qt_arch }}
         modules: 'qtmultimedia qtimageformats'
         cache: true
 
@@ -220,17 +457,42 @@ jobs:
       run: |
         mkdir -p $HOME/local/{bin,include,lib}
         echo "$HOME/local/bin" >> $GITHUB_PATH
-        echo "PKG_CONFIG_PATH=$HOME/local/lib/pkgconfig:$HOME/local/lib/x86_64-linux-gnu/pkgconfig" >> $GITHUB_ENV
+        echo "PKG_CONFIG_PATH=$HOME/local/lib/pkgconfig:$HOME/local/lib/${{ matrix.multiarch }}/pkgconfig" >> $GITHUB_ENV
         echo "UBUNTU_RELEASE=$(lsb_release -rs)" >> $GITHUB_ENV
 
-    # This may still install various Qt packages, but the later install step will override them
+    # 编译缓存:SDL3/FFmpeg/libplacebo 等源码依赖每次全量重编是本 job 的耗时大头。
+    # 这些依赖的 REV 全部钉死,ccache 命中率接近 100%;app 自身增量变更也吃得到。
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ccache
+        key: ccache-linux-${{ matrix.arch }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-linux-${{ matrix.arch }}-
+
+    - name: Install ccache
+      run: |
+        sudo apt-get install -y ccache
+        # 把 /usr/lib/ccache(编译器包装器目录)顶到 PATH 最前,cmake/make/configure 无感知接入
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+        ccache --max-size=2G
+        ccache -z
+
+    # 注意顺序：上面的 install-qt-action 已经装好了 6.11.1 并把它的 qmake 放进 PATH，
+    # （Qt 暂回 6.11.1：6.11.2 下 overlay_button_native_wake 各唤醒点全挂，
+    #   疑似 6.11.2 XCB 事件投递行为变化，排查清楚前不跟）
+    # 这一步在它之后。所以这里不要再 apt 装任何 Qt 包 —— 发行版的 Qt（jammy 上是
+    # 6.2.x）不会被用到，装了只是白下载，还可能在 AppImage 打包阶段被扫进去。
     - name: Install packaged deps
       run: |
-        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
-        if [[ $UBUNTU_RELEASE == "20.04" ]]; then
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.280-focal.list https://packages.lunarg.com/vulkan/1.3.280/lunarg-vulkan-1.3.280-focal.list
-        else
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.280-jammy.list https://packages.lunarg.com/vulkan/1.3.280/lunarg-vulkan-1.3.280-jammy.list
+        # LunarG 的源只发 amd64/i386（dists/jammy/main 下就没有 binary-arm64），
+        # 所以 vulkan-sdk 这条路只有 x86_64 能走，arm64 用发行版的 loader，
+        # 头文件和 glslang 在下一步单独编。
+        if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          # 1.4.313 只有 jammy/noble 的 list(focal 已停发);矩阵里 LunarG 只在
+          # 22.04 上消费,固定用 jammy 的
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.4.313-jammy.list https://packages.lunarg.com/vulkan/1.4.313/lunarg-vulkan-1.4.313-jammy.list
         fi
         sudo apt update || true
         sudo apt install -y \
@@ -238,22 +500,88 @@ jobs:
           libdbus-1-dev libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libglu1-mesa-dev \
           libibus-1.0-dev libpulse-dev libudev-dev libx11-dev libxcursor-dev libxext-dev \
           libxi-dev libxinerama-dev libxkbcommon-dev libxrandr-dev libxss-dev libxt-dev \
-          libxv-dev libxxf86vm-dev libxcb-dri3-dev libx11-xcb-dev libwayland-dev wayland-protocols \
+          libxv-dev libxxf86vm-dev libxcb1-dev libxcb-dri3-dev libx11-xcb-dev libwayland-dev wayland-protocols \
           libxfixes-dev libxtst-dev libpipewire-0.3-dev \
-          libopus-dev libvdpau-dev vulkan-sdk qt6-multimedia-dev cmake
-        
+          libopus-dev libvdpau-dev cmake xvfb xauth
+
+        if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+          sudo apt install -y vulkan-sdk
+        else
+          # libplacebo 需要一个 SPIR-V 编译器，否则 Vulkan 渲染器编得出来但跑不起来。
+          # x86_64 是从 LunarG SDK 里拿 shaderc 2023.8.1，noble 自带的 libshaderc-dev
+          # 正好也是 2023.8，两个架构走同一条代码路径。
+          # 别换成 glslang：libplacebo 那边是用 cxx.find_library('SPIRV') 找的，
+          # 装到 /usr/local 也认不出来（试过，summary 里 glslang 一样是 NO），
+          # 而 shaderc 走 pkg-config，稳。
+          sudo apt install -y libshaderc-dev
+        fi
+
         # Install XCB runtime libraries for Qt6 XCB platform plugin
         echo "Installing XCB runtime libraries..."
         sudo apt install -y libxcb1 libxcb-cursor0 libxcb-keysyms1 libxcb-image0 libxcb-shm0 libxcb-icccm4 libxcb-sync1 libxcb-xfixes0 libxcb-shape0 libxcb-randr0 libxcb-render0 libxcb-render-util0 libxcb-xinerama0 libxcb-xkb1 libxcb-util1
-        sudo pip3 install meson
+
+        # 24.04 起 pip 是 externally-managed，`pip3 install` 会直接被 PEP 668 拒掉；
+        # 好在 noble 自带的 meson 已经 1.3，够 libplacebo（>= 0.63）用。jammy 的是
+        # 0.61，太老，只能继续走 pip。
+        if [[ $UBUNTU_RELEASE == "24.04" ]]; then
+          sudo apt install -y meson
+        else
+          sudo pip3 install meson
+        fi
 
         if [[ $UBUNTU_RELEASE == "22.04" ]]; then
           # Needed for AppImage
           sudo apt install libfuse2
         fi
+
+    - name: Test Linux display event wakeups
+      run: |
+        pushd tests/linux_display_event_monitor
+        qmake linux_display_event_monitor.pro
+        make -j"$(nproc)"
+        ./linux_display_event_monitor
+        popd
+
+        pushd tests/overlay_button_native_wake
+        qmake overlay_button_native_wake.pro
+        make -j"$(nproc)"
+        # xvfb 下 XTest 合成事件与异步唤醒的时序受 runner 负载影响,偶发抖动
+        # (失败点会在多个唤醒断言间轮转);失败自动整测重跑一次
+        QT_QPA_PLATFORM=xcb xvfb-run -a ./overlay_button_native_wake ||         QT_QPA_PLATFORM=xcb xvfb-run -a ./overlay_button_native_wake
+        popd
+
+        # Linux 上跑 USB 转发的 sysfs 枚举解析(会覆盖 driver symlink 绑定断言)
+        pushd tests/usb_forwarding_backend_sysfs
+        qmake usb_forwarding_backend_sysfs.pro
+        make -j"$(nproc)"
+        ./usb_forwarding_backend_sysfs_test
+        popd
+
+    # arm64 上没有 LunarG 源，Vulkan 那套要手工补：noble 自带的 loader 是 1.3.275，
+    # 而 FFmpeg configure 卡的是 `vulkan >= 1.3.277`（pkg-config 版本号），差这么一点
+    # 也过不去，不补的话 *_vulkan hwaccel 直接把 configure 打挂。vulkan.pc 是 Loader
+    # 装的，只装 Headers 不够，所以两个都得编。
+    - name: Build Vulkan loader (aarch64)
+      if: matrix.arch == 'aarch64'
+      run: |
+        export VULKAN_VER=v1.4.313
+        git clone --branch $VULKAN_VER --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
+        cmake -S Vulkan-Headers -B Vulkan-Headers/build
+        sudo cmake --install Vulkan-Headers/build
+
+        git clone --branch $VULKAN_VER --depth 1 https://github.com/KhronosGroup/Vulkan-Loader.git
+        cmake -S Vulkan-Loader -B Vulkan-Loader/build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_PREFIX_PATH=/usr/local \
+          -DBUILD_TESTS=OFF
+        cmake --build Vulkan-Loader/build -j$(nproc)
+        sudo cmake --install Vulkan-Loader/build
+        sudo ldconfig
+
+        pkg-config --modversion vulkan
     - name: Build SDL3
       run: |
-        export SDL3_REV=3bde3e24069db59133bc1e8dbe3c693008821a93
+        export SDL3_REV=ddba673cddfa79ce798eca5ba402e0f1a2a2a243
         git clone https://github.com/libsdl-org/SDL.git SDL3
         cd SDL3
         git checkout $SDL3_REV
@@ -265,7 +593,8 @@ jobs:
 
     - name: Build sdl2-compat
       run: |
-        export SDL2_COMPAT_REV=1c8ece4de9db96d01f99296c26a87a4cabb72f54
+        # release-2.32.70 的不可变 commit(可变 ref 会让同 workflow 拿到不同源码)
+        export SDL2_COMPAT_REV=a53b6ad90ecd2d0ccfe01d5cfd2059793acf8c12
         git clone https://github.com/libsdl-org/sdl2-compat.git sdl2-compat
         cd sdl2-compat
         git checkout $SDL2_COMPAT_REV
@@ -277,10 +606,12 @@ jobs:
 
     - name: Build SDL2_ttf
       run: |
-        export SDL2_TTF_VER=2.22.0
-        wget https://github.com/libsdl-org/SDL_ttf/releases/download/release-$SDL2_TTF_VER/SDL2_ttf-$SDL2_TTF_VER.tar.gz
-        tar -xf SDL2_ttf-$SDL2_TTF_VER.tar.gz
-        cd SDL2_ttf-$SDL2_TTF_VER
+        export SDL2_TTF_REV=a883e490e30fb44a5336ea3dcb990c6982c5216f
+        git clone https://github.com/libsdl-org/SDL_ttf.git SDL_ttf
+        cd SDL_ttf
+        git checkout $SDL2_TTF_REV
+        git submodule update --init --recursive
+        ./autogen.sh
         ./configure
         make -j$(nproc)
         sudo make install
@@ -288,11 +619,11 @@ jobs:
 
     - name: Build libva
       run: |
-        export LIBVA_VER=2.22.0
+        export LIBVA_VER=2.24.1
         git clone --branch $LIBVA_VER --depth 1 https://github.com/intel/libva.git
         cd libva
         ./autogen.sh
-        
+
         # Configure with conditional Wayland support
         echo "Configuring libva..."
         if pkg-config --exists wayland-client; then
@@ -302,7 +633,7 @@ jobs:
           echo "Configuring libva without Wayland support"
           ./configure --enable-x11 --disable-wayland
         fi
-        
+
         make -j$(nproc)
         sudo make install
         sudo ldconfig
@@ -310,7 +641,7 @@ jobs:
 
     - name: Build dav1d
       run: |
-        export DAV1D_VER=1.5.0
+        export DAV1D_VER=1.5.4
         git clone --branch $DAV1D_VER --depth 1 https://code.videolan.org/videolan/dav1d.git
         cd dav1d
         meson setup build -Ddefault_library=static -Dbuildtype=release -Denable_tools=false -Denable_tests=false
@@ -321,7 +652,7 @@ jobs:
 
     - name: Build libplacebo
       run: |
-        export LIBPLACEBO_REV=v7.349.0
+        export LIBPLACEBO_REV=41ac2980e1a898f41d7c2e07999f9862ee89d99f
         git clone https://code.videolan.org/videolan/libplacebo.git
         cd libplacebo
         git checkout $LIBPLACEBO_REV
@@ -330,6 +661,13 @@ jobs:
         fi
         git submodule update --init --recursive
         meson setup build -Dvulkan=enabled -Dopengl=disabled -Ddemos=false
+        # libplacebo 在两个 SPIR-V 编译器都找不到的情况下不会报错，只是在 summary 里
+        # 写 shaderc/glslang: NO，然后编出一个 Vulkan 渲染器跑不起来的库。arm64 第一版
+        # 就是这么静默退化的，所以在这儿拦一道。
+        if ! grep -qE "^ +(shaderc|glslang) +: +YES" build/meson-logs/meson-log.txt; then
+          echo "::error::libplacebo 没找到任何 SPIR-V 编译器（shaderc/glslang），Vulkan 渲染器会编得过但跑不起来"
+          exit 1
+        fi
         ninja -C build
         sudo ninja install -C build
         sudo ldconfig
@@ -337,8 +675,8 @@ jobs:
 
     - name: Build FFmpeg
       run: |
-        export FFMPEG_REV=87ccf995cb855f0baced9916928b7b48d8b6ed9d
-        export FFMPEG_CONFIGURE_ARGS="--enable-pic --disable-static --enable-shared --disable-all --enable-avcodec --enable-avformat --enable-swscale --enable-decoder=h264 --enable-decoder=hevc --enable-decoder=av1 --enable-hwaccel=h264_vaapi --enable-hwaccel=hevc_vaapi --enable-hwaccel=av1_vaapi --enable-hwaccel=h264_vdpau --enable-hwaccel=hevc_vdpau --enable-hwaccel=av1_vdpau --enable-libdrm --enable-hwaccel=h264_vulkan --enable-hwaccel=hevc_vulkan --enable-hwaccel=av1_vulkan --enable-libdav1d --enable-decoder=libdav1d"
+        export FFMPEG_REV=n9.0
+        export FFMPEG_CONFIGURE_ARGS="--enable-pic --enable-lto --disable-static --enable-shared --disable-all --disable-autodetect --enable-avcodec --enable-avformat --enable-swscale --enable-decoder=h264 --enable-decoder=hevc --enable-decoder=av1 --enable-vaapi --enable-hwaccel=h264_vaapi --enable-hwaccel=hevc_vaapi --enable-hwaccel=av1_vaapi --enable-vdpau --enable-hwaccel=h264_vdpau --enable-hwaccel=hevc_vdpau --enable-hwaccel=av1_vdpau --enable-libdrm --enable-vulkan --enable-hwaccel=h264_vulkan --enable-hwaccel=hevc_vulkan --enable-hwaccel=av1_vulkan --enable-libdav1d --enable-decoder=libdav1d"
         git clone https://github.com/FFmpeg/FFmpeg.git FFmpeg
         cd FFmpeg
         git checkout $FFMPEG_REV
@@ -348,18 +686,23 @@ jobs:
         sudo ldconfig
         cd ..
 
+    - name: Show ccache stats
+      run: ccache --show-stats
+
     - name: Install linuxdeploy
       run: |
         mkdir -p $HOME/bin
-        wget -O $HOME/bin/linuxdeploy-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-        wget -O $HOME/bin/linuxdeploy-plugin-qt-x86_64.AppImage https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+        # 文件名要和 build-appimage.sh 里的 linuxdeploy-$(uname -m).AppImage 对得上：
+        # uname -m 在两台 runner 上分别是 x86_64 / aarch64，正好是上游的资产名。
+        wget -O $HOME/bin/linuxdeploy-${{ matrix.arch }}.AppImage https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+        wget -O $HOME/bin/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
         chmod a+x $HOME/bin/linuxdeploy*.AppImage
 
     - name: Setup FUSE for AppImage
       run: |
         # Configure FUSE for AppImage in CI environment
         echo "Setting up FUSE environment for AppImage..."
-        
+
         # Check if FUSE is available
         if [ -f /dev/fuse ]; then
           echo "✅ /dev/fuse is available"
@@ -368,10 +711,10 @@ jobs:
           sudo mknod /dev/fuse c 10 229 || echo "Failed to create /dev/fuse"
           sudo chmod 666 /dev/fuse || echo "Failed to set permissions on /dev/fuse"
         fi
-        
+
         # Check FUSE library
         ldconfig -p | grep fuse || echo "FUSE library not found in ldconfig"
-        
+
         # Set environment variable for AppImage extraction mode if FUSE fails
         echo "APPIMAGE_EXTRACT_AND_RUN=1" >> $GITHUB_ENV
 
@@ -389,26 +732,44 @@ jobs:
         # export QT_SELECT=5
         # export PATH=/usr/lib/qt5/bin:$PATH
         # export QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/qt5/plugins
-        
+
         # Add linuxdeploy to PATH
         export PATH=$PATH:$HOME/bin
-        
+
         echo "Building AppImage with CI-optimized settings..."
         echo "APPIMAGE_EXTRACT_AND_RUN=$APPIMAGE_EXTRACT_AND_RUN"
         echo "PATH includes: $HOME/bin"
-        
+
         # Run the build script
         scripts/build-appimage.sh
+
+    - name: Verify AppImage
+      run: |
+        appimage="build/installer-release/Moonlight-VPlus-${VERSION}-${{ matrix.arch }}.AppImage"
+
+        if [[ ! -s "$appimage" ]]; then
+          echo "::error file=$appimage::AppImage is missing or empty"
+          exit 1
+        fi
+
+        if [[ ! -s "${appimage}.zsync" ]]; then
+          echo "::error file=${appimage}.zsync::zsync is missing or empty"
+          exit 1
+        fi
 
     - name: Upload AppImage artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Moonlight-r${{ env.BUILD_NUMBER }}-x86_64.AppImage
-        path: build/installer-release/Moonlight-*-x86_64.AppImage
+        name: Moonlight-VPlus-r${{ env.BUILD_NUMBER }}-${{ matrix.arch }}.AppImage
+        path: |
+          build/installer-release/Moonlight-VPlus-*-${{ matrix.arch }}.AppImage
+          build/installer-release/Moonlight-VPlus-*-${{ matrix.arch }}.AppImage.zsync
+        if-no-files-found: error
+
 
   build-steamlink:
     runs-on: ubuntu-22.04
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -422,9 +783,31 @@ jobs:
         sudo apt update
         sudo apt install -y libc6:i386 libstdc++6:i386
 
+    - name: Derive weekly cache key
+      run: echo "WEEK=$(date +%G-W%V)" >> $GITHUB_ENV
+
+    - name: Restore SteamLink SDK
+      id: steamlink-sdk
+      uses: actions/cache@v4
+      with:
+        path: ~/steamlink-sdk
+        key: steamlink-sdk-${{ env.WEEK }}
+        restore-keys: |
+          steamlink-sdk-
+
     - name: Download SteamLink SDK
+      if: steps.steamlink-sdk.outputs.cache-hit != 'true'
       run: |
-        git clone --depth=1 https://github.com/ValveSoftware/steamlink-sdk.git $HOME/steamlink-sdk
+        # restore-keys 命中上周缓存时目录已存在——不能直接沿用,否则旧 SDK 会被
+        # cache post-step 打上本周的新 key 无限传递。fetch + reset 到远端 HEAD,
+        # 让 SDK 始终跟住上游默认分支(变更不频繁,fetch 增量很小)。
+        if [ -d "$HOME/steamlink-sdk/.git" ]; then
+          git -C "$HOME/steamlink-sdk" fetch --depth=1 origin
+          git -C "$HOME/steamlink-sdk" remote set-head origin --auto
+          git -C "$HOME/steamlink-sdk" reset --hard origin/HEAD
+        else
+          git clone --depth=1 https://github.com/ValveSoftware/steamlink-sdk.git "$HOME/steamlink-sdk"
+        fi
 
     - name: Get version
       run: |
@@ -439,25 +822,34 @@ jobs:
     - name: Upload SteamLink artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Moonlight-SteamLink-r${{ env.BUILD_NUMBER }}
-        path: build/installer-release/Moonlight-SteamLink-*.zip
+        name: Moonlight-VPlus-SteamLink-r${{ env.BUILD_NUMBER }}
+        path: build/installer-release/Moonlight-VPlus-SteamLink-*.zip
 
   release:
-    if: github.event_name == 'release'
-    needs: [build-windows, build-macos, build-linux, build-steamlink]
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_release && github.ref_type == 'tag')
+    needs: [qml-lint, version-tests, cpp-format, build-windows, build-macos, build-linux, build-steamlink]
     runs-on: ubuntu-latest
-    
+
     steps:
+    - name: Verify existing release before replacing assets
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_TAG: ${{ github.ref_name }}
+      run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+
     - name: Download all artifacts
       uses: actions/download-artifact@v4
 
     - name: Upload release assets
       uses: softprops/action-gh-release@v1
       with:
+        tag_name: ${{ github.event.release.tag_name || github.ref_name }}
         files: |
           **/*.exe
           **/*.zip
           **/*.dmg
           **/*.AppImage
+          **/*.AppImage.zsync
       env:
         GITHUB_TOKEN: ${{ secrets.GH_BOT_TOKEN }}

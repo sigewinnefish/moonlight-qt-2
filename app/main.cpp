@@ -1,8 +1,10 @@
 #include <QGuiApplication>
+#include <QStyleHints>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QDir>
 #include <QIcon>
+#include <QLibraryInfo>
 #include <QQuickStyle>
 #include <QMutex>
 #include <QtDebug>
@@ -15,6 +17,7 @@
 #include <QRegularExpression>
 #include <QFontDatabase>
 #include <QLocale>
+#include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
 
@@ -85,12 +88,23 @@ static QString getStartupApplicationDir(const char* argv0)
 #include "backend/autoupdatechecker.h"
 #include "backend/computermanager.h"
 #include "backend/systemproperties.h"
+#include "backend/usbforwardingenvironment.h"
+#include "backend/usbforwardingbackend.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
 #include "gui/sdlgamepadkeynavigation.h"
+#include "gui/windowplacement.h"
+#include "gui/windowswindowchrome.h"
 #include "imageutils.h"
+#include "uifont.h"
 #include "streaming/macpermissions.h"
+#ifdef Q_OS_DARWIN
+#include "gui/macwindowchrome.h"
+#endif
 
+#ifdef Q_OS_WIN32
+// 只有 Windows 分支的 app.setFont() 会用到它。不加这层 #ifdef 的话，其他平台每次
+// 构建都会报一条 -Wunused-function。
 static bool shouldUseChineseWindowsUiFont(StreamingPreferences::Language language)
 {
     switch (language) {
@@ -103,6 +117,7 @@ static bool shouldUseChineseWindowsUiFont(StreamingPreferences::Language languag
         return false;
     }
 }
+#endif
 
 #if defined(Q_OS_WIN32)
 #define IS_UNSPECIFIED_HANDLE(x) ((x) == INVALID_HANDLE_VALUE || (x) == NULL)
@@ -319,12 +334,179 @@ void ffmpegLogToDiskHandler(void* ptr, int level, const char* fmt, va_list vl)
 
 #endif
 
+#ifdef LOG_TO_FILE
+static QString prepareLogDirectory()
+{
+    QDir logDirectory(Path::getLogDir());
+    if (logDirectory.exists() || logDirectory.mkpath(".")) {
+        return logDirectory.absolutePath();
+    }
+
+    QDir fallbackDirectory(QDir(QDir::tempPath()).filePath(QCoreApplication::applicationName() + "/logs"));
+    if (!fallbackDirectory.exists() && !fallbackDirectory.mkpath(".")) {
+        fallbackDirectory = QDir(QDir::tempPath());
+    }
+    qWarning() << "Failed to create log directory:" << logDirectory.absolutePath()
+               << "Falling back to:" << fallbackDirectory.absolutePath();
+    return fallbackDirectory.absolutePath();
+}
+#endif
+
 #ifdef Q_OS_WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <io.h>
 
-static UINT s_HitUnhandledException = 0;
+static volatile LONG s_HitUnhandledException = 0;
+static WCHAR s_CrashDumpDirectory[MAX_PATH] = {};
+static WCHAR s_CrashLogFileName[MAX_PATH] = {};
+static WCHAR s_CrashBuildVersion[128] = {};
+static constexpr size_t CRASH_DIAGNOSTIC_MESSAGE_LENGTH = 2048;
+static constexpr int MAX_MINIDUMP_FILES = 3;
+static CHAR s_CrashUtf8Message[CRASH_DIAGNOSTIC_MESSAGE_LENGTH * 3 + 1] = {};
+static HANDLE s_CrashLogHandle = INVALID_HANDLE_VALUE;
+static HANDLE s_CrashFallbackHandle = INVALID_HANDLE_VALUE;
+static DWORD s_CrashStackGuaranteeError = ERROR_SUCCESS;
+
+static void copyCrashDiagnosticString(WCHAR* destination, size_t destinationLength, const QString& source)
+{
+    const QString nativeSource = QDir::toNativeSeparators(source);
+    wcsncpy_s(destination,
+              destinationLength,
+              reinterpret_cast<const wchar_t*>(nativeSource.utf16()),
+              _TRUNCATE);
+}
+
+static void initializeCrashDiagnostics(const QString& dumpDirectory,
+                                        const QString& logFileName,
+                                        HANDLE logHandle,
+                                        HANDLE fallbackHandle)
+{
+    copyCrashDiagnosticString(s_CrashDumpDirectory, _countof(s_CrashDumpDirectory), dumpDirectory);
+    copyCrashDiagnosticString(s_CrashLogFileName, _countof(s_CrashLogFileName), logFileName);
+    copyCrashDiagnosticString(s_CrashBuildVersion,
+                              _countof(s_CrashBuildVersion),
+                              QString::fromUtf8(VERSION_STR));
+    s_CrashLogHandle = logHandle;
+    s_CrashFallbackHandle = fallbackHandle;
+
+    // Leave enough stack for the top-level handler on the GUI thread if the
+    // original failure is a stack overflow.
+    ULONG stackGuarantee = 64 * 1024;
+    if (!SetThreadStackGuarantee(&stackGuarantee)) {
+        s_CrashStackGuaranteeError = GetLastError();
+    }
+}
+
+static QString prepareCrashDumpDirectory(const QString& fallbackLogDirectory)
+{
+    QDir dumpDirectory(Path::getDumpDir());
+    if (dumpDirectory.exists() || dumpDirectory.mkpath(".")) {
+        return dumpDirectory.absolutePath();
+    }
+
+    qWarning() << "Failed to create minidump directory:" << dumpDirectory.absolutePath()
+               << "Falling back to:" << fallbackLogDirectory;
+    return fallbackLogDirectory;
+}
+
+static void pruneOldMinidumps(const QString& dumpDirectory)
+{
+    QDir directory(dumpDirectory);
+    const QStringList existingDumpNames = directory.entryList(
+            QStringList(QStringLiteral("Moonlight-*.dmp")),
+            QDir::Files,
+            QDir::Time);
+
+    // Keep one slot available for a crash in the current process. Pruning here
+    // avoids doing directory enumeration from the unhandled-exception handler.
+    for (int i = MAX_MINIDUMP_FILES - 1; i < existingDumpNames.size(); i++) {
+        const QString dumpName = existingDumpNames.at(i);
+        if (!QFile(directory.filePath(dumpName)).remove()) {
+            qWarning() << "Failed to remove old minidump:" << dumpName;
+        }
+    }
+}
+
+static const WCHAR* exceptionCodeName(DWORD exceptionCode)
+{
+    switch (exceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:         return L"EXCEPTION_ACCESS_VIOLATION";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:   return L"EXCEPTION_ARRAY_BOUNDS_EXCEEDED";
+    case EXCEPTION_BREAKPOINT:              return L"EXCEPTION_BREAKPOINT";
+    case EXCEPTION_DATATYPE_MISALIGNMENT:   return L"EXCEPTION_DATATYPE_MISALIGNMENT";
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:      return L"EXCEPTION_FLT_DIVIDE_BY_ZERO";
+    case EXCEPTION_FLT_INVALID_OPERATION:   return L"EXCEPTION_FLT_INVALID_OPERATION";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:     return L"EXCEPTION_ILLEGAL_INSTRUCTION";
+    case EXCEPTION_IN_PAGE_ERROR:           return L"EXCEPTION_IN_PAGE_ERROR";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:      return L"EXCEPTION_INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_PRIV_INSTRUCTION:        return L"EXCEPTION_PRIV_INSTRUCTION";
+    case EXCEPTION_STACK_OVERFLOW:          return L"EXCEPTION_STACK_OVERFLOW";
+    case 0xE06D7363:                        return L"MSVC_CPP_EXCEPTION";
+    default:                                return L"UNKNOWN_EXCEPTION";
+    }
+}
+
+static void appendCrashDiagnostic(const WCHAR* message)
+{
+    HANDLE outputHandle = INVALID_HANDLE_VALUE;
+    bool closeOutputHandle = false;
+
+    if (s_CrashLogFileName[0] != L'\0') {
+        outputHandle = CreateFileW(s_CrashLogFileName,
+                                   FILE_APPEND_DATA,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr,
+                                   OPEN_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                                   nullptr);
+        closeOutputHandle = outputHandle != INVALID_HANDLE_VALUE;
+    }
+
+    if (IS_UNSPECIFIED_HANDLE(outputHandle)) {
+        outputHandle = s_CrashLogHandle;
+    }
+    if (IS_UNSPECIFIED_HANDLE(outputHandle)) {
+        outputHandle = s_CrashFallbackHandle;
+    }
+    if (IS_UNSPECIFIED_HANDLE(outputHandle)) {
+        outputHandle = GetStdHandle(STD_ERROR_HANDLE);
+    }
+
+    if (!IS_UNSPECIFIED_HANDLE(outputHandle)) {
+        const int utf8Length = WideCharToMultiByte(CP_UTF8,
+                                                   0,
+                                                   message,
+                                                   -1,
+                                                   s_CrashUtf8Message,
+                                                   sizeof(s_CrashUtf8Message),
+                                                   nullptr,
+                                                   nullptr);
+        if (utf8Length > 1) {
+            DWORD bytesWritten;
+            WriteFile(outputHandle, s_CrashUtf8Message, utf8Length - 1, &bytesWritten, nullptr);
+            FlushFileBuffers(outputHandle);
+        }
+    }
+
+    if (closeOutputHandle) {
+        CloseHandle(outputHandle);
+    }
+
+    OutputDebugStringW(message);
+}
+
+static ULONGLONG currentUnixTimeSeconds()
+{
+    FILETIME fileTime;
+    GetSystemTimeAsFileTime(&fileTime);
+
+    ULARGE_INTEGER ticks;
+    ticks.LowPart = fileTime.dwLowDateTime;
+    ticks.HighPart = fileTime.dwHighDateTime;
+    return (ticks.QuadPart - 116444736000000000ULL) / 10000000ULL;
+}
 
 LONG WINAPI UnhandledExceptionHandler(struct _EXCEPTION_POINTERS *ExceptionInfo)
 {
@@ -333,10 +515,47 @@ LONG WINAPI UnhandledExceptionHandler(struct _EXCEPTION_POINTERS *ExceptionInfo)
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    WCHAR dmpFileName[MAX_PATH];
-    swprintf_s(dmpFileName, L"%ls\\Moonlight-%I64u.dmp",
-               (PWCHAR)QDir::toNativeSeparators(Path::getLogDir()).utf16(), QDateTime::currentSecsSinceEpoch());
-    QString qDmpFileName = QString::fromUtf16((const char16_t*)dmpFileName);
+    const EXCEPTION_RECORD* exceptionRecord = ExceptionInfo ? ExceptionInfo->ExceptionRecord : nullptr;
+    const DWORD exceptionCode = exceptionRecord ? exceptionRecord->ExceptionCode : 0;
+    const void* exceptionAddress = exceptionRecord ? exceptionRecord->ExceptionAddress : nullptr;
+
+    const WCHAR* memoryOperation = L"not-applicable";
+    const void* memoryAddress = nullptr;
+    if (exceptionRecord &&
+            (exceptionCode == EXCEPTION_ACCESS_VIOLATION || exceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+            exceptionRecord->NumberParameters >= 2) {
+        switch (exceptionRecord->ExceptionInformation[0]) {
+        case 0: memoryOperation = L"read"; break;
+        case 1: memoryOperation = L"write"; break;
+        case 8: memoryOperation = L"execute"; break;
+        default: memoryOperation = L"unknown"; break;
+        }
+        memoryAddress = reinterpret_cast<const void*>(exceptionRecord->ExceptionInformation[1]);
+    }
+
+    WCHAR diagnosticMessage[CRASH_DIAGNOSTIC_MESSAGE_LENGTH];
+    _snwprintf_s(diagnosticMessage,
+                _countof(diagnosticMessage),
+                _TRUNCATE,
+                L"[crash] Unhandled exception: code=0x%08lX (%ls), address=%p, "
+                L"thread=%lu, operation=%ls, "
+                L"memory_address=%p, build=%ls\r\n",
+                exceptionCode,
+                exceptionCodeName(exceptionCode),
+                exceptionAddress,
+                GetCurrentThreadId(),
+                memoryOperation,
+                memoryAddress,
+                s_CrashBuildVersion);
+    appendCrashDiagnostic(diagnosticMessage);
+
+    WCHAR dmpFileName[MAX_PATH + 64];
+    _snwprintf_s(dmpFileName,
+                 _countof(dmpFileName),
+                 _TRUNCATE,
+                 L"%ls\\Moonlight-%I64u.dmp",
+                 s_CrashDumpDirectory,
+                 currentUnixTimeSeconds());
     HANDLE dumpHandle = CreateFileW(dmpFileName, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (dumpHandle != INVALID_HANDLE_VALUE) {
         MINIDUMP_EXCEPTION_INFORMATION info;
@@ -357,17 +576,61 @@ LONG WINAPI UnhandledExceptionHandler(struct _EXCEPTION_POINTERS *ExceptionInfo)
                                &info,
                                nullptr,
                                nullptr)) {
-            qCritical() << "Unhandled exception! Minidump written to:" << qDmpFileName;
+            _snwprintf_s(diagnosticMessage,
+                         _countof(diagnosticMessage),
+                         _TRUNCATE,
+                         L"[crash] Minidump written to: %ls\r\n",
+                         dmpFileName);
+            appendCrashDiagnostic(diagnosticMessage);
         }
         else {
-            qCritical() << "Unhandled exception! Failed to write dump:" << GetLastError();
+            _snwprintf_s(diagnosticMessage,
+                         _countof(diagnosticMessage),
+                         _TRUNCATE,
+                         L"[crash] Failed to write minidump: error=%lu\r\n",
+                         GetLastError());
+            appendCrashDiagnostic(diagnosticMessage);
         }
 
         CloseHandle(dumpHandle);
     }
     else {
-        qCritical() << "Unhandled exception! Failed to open dump file:" << qDmpFileName << "with error" << GetLastError();
+        _snwprintf_s(diagnosticMessage,
+                     _countof(diagnosticMessage),
+                     _TRUNCATE,
+                     L"[crash] Failed to open minidump file: path=%ls, error=%lu\r\n",
+                     dmpFileName,
+                     GetLastError());
+        appendCrashDiagnostic(diagnosticMessage);
     }
+
+    // Resolve the module only after the dump is safely written. These APIs may
+    // need the loader lock, which can already be held by the crashing thread.
+    HMODULE faultModule = nullptr;
+    WCHAR faultModulePath[MAX_PATH] = L"unknown";
+    const WCHAR* faultModuleName = faultModulePath;
+    ULONGLONG moduleOffset = 0;
+    if (exceptionAddress &&
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(exceptionAddress),
+                               &faultModule)) {
+        if (GetModuleFileNameW(faultModule, faultModulePath, _countof(faultModulePath)) != 0) {
+            if (const WCHAR* lastSeparator = wcsrchr(faultModulePath, L'\\')) {
+                faultModuleName = lastSeparator + 1;
+            }
+        }
+        moduleOffset = reinterpret_cast<ULONG_PTR>(exceptionAddress) -
+                       reinterpret_cast<ULONG_PTR>(faultModule);
+    }
+
+    _snwprintf_s(diagnosticMessage,
+                 _countof(diagnosticMessage),
+                 _TRUNCATE,
+                 L"[crash] Fault module: module=%ls, module_offset=0x%llX\r\n",
+                 faultModuleName,
+                 moduleOffset);
+    appendCrashDiagnostic(diagnosticMessage);
 
     // Sleep for a moment to allow the logging thread to finish up before crashing
     if (g_AsyncLoggingEnabled) {
@@ -467,6 +730,45 @@ void configureSignalHandlers()
 
 #endif
 
+// 暗色 Material 配置：Qt <6.8 的默认样式，也是发行版 Qt 缺 FluentWinUI3 时
+// 的回退（Ubuntu 26.04 的 Qt 就没带这个样式的 QML）。图标按暗色主题绘制，
+// 所以主题不允许用户覆盖；其余 Material 变量保留用户覆盖权。
+static void configureMaterialFallback()
+{
+    QQuickStyle::setStyle("Material");
+
+    // Our icons are styled for a dark theme, so we do not allow the user to override this
+    qputenv("QT_QUICK_CONTROLS_MATERIAL_THEME", "Dark");
+
+    // These are defaults that we allow the user to override
+    if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_ACCENT")) {
+        qputenv("QT_QUICK_CONTROLS_MATERIAL_ACCENT", "Purple");
+    }
+    if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_VARIANT")) {
+        qputenv("QT_QUICK_CONTROLS_MATERIAL_VARIANT", "Dense");
+    }
+    if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_PRIMARY")) {
+        // Qt 6.9 began to use a different shade of Material.Indigo when we use a dark theme
+        // (which is all the time). The new color looks washed out, so manually specify the
+        // old primary color unless the user overrides it themselves.
+        qputenv("QT_QUICK_CONTROLS_MATERIAL_PRIMARY", "#3F51B5");
+    }
+}
+
+// Qt Quick Controls 的样式就是 QML imports 下的一个目录；QQuickStyle 没有公开
+// 的样式枚举，所以用文件系统探测。样式缺失时硬 setStyle 会让整个 QML 树
+// 加载失败（Ubuntu 26.04 的 Qt 不带 FluentWinUI3，实测如此）。只在 6.8+ 分支
+// 被调用；QLibraryInfo::QmlImportsPath 是 Qt 6.2+ API，老 Qt（SteamLink）编
+// 不过，跟着调用点一起锁版本。
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+static bool styleQmlAvailable(const QString& style)
+{
+    const QString qmldir = QLibraryInfo::path(QLibraryInfo::QmlImportsPath) +
+                           QStringLiteral("/QtQuick/Controls/") + style + QStringLiteral("/qmldir");
+    return QFile::exists(qmldir);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     SDL_SetMainReady();
@@ -508,19 +810,32 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef LOG_TO_FILE
-    QDir tempDir(Path::getLogDir());
+    const QString logDirectory = prepareLogDirectory();
+    QDir logDir(logDirectory);
 
 #ifdef Q_OS_WIN32
     // Only log to a file if the user didn't redirect stderr somewhere else
     if (IS_UNSPECIFIED_HANDLE(oldConErr))
 #endif
     {
-        s_LoggerFile = new QFile(tempDir.filePath(QString("Moonlight-%1.log").arg(QDateTime::currentSecsSinceEpoch())));
+        s_LoggerFile = new QFile(logDir.filePath(QString("Moonlight-%1.log").arg(QDateTime::currentSecsSinceEpoch())));
         if (s_LoggerFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream(stderr) << "Redirecting log output to " << s_LoggerFile->fileName() << Qt::endl;
             s_LoggerStream.setDevice(s_LoggerFile);
         }
     }
+#endif
+
+#ifdef Q_OS_WIN32
+    const QString crashDumpDirectory = prepareCrashDumpDirectory(logDirectory);
+    initializeCrashDiagnostics(crashDumpDirectory,
+                               s_LoggerFile && s_LoggerFile->isOpen()
+                                       ? s_LoggerFile->fileName()
+                                       : QString(),
+                               s_LoggerFile && s_LoggerFile->isOpen()
+                                       ? reinterpret_cast<HANDLE>(_get_osfhandle(s_LoggerFile->handle()))
+                                       : INVALID_HANDLE_VALUE,
+                               oldConErr);
 #endif
 
     // Serialize log messages on a single thread
@@ -537,21 +852,28 @@ int main(int argc, char *argv[])
     SDL_LogSetOutputFunction(sdlLogToDiskHandler, nullptr);
 #endif
     qInstallMessageHandler(qtLogToDiskHandler);
+#ifdef Q_OS_WIN32
+    if (s_CrashStackGuaranteeError != ERROR_SUCCESS) {
+        qWarning() << "Failed to reserve stack for crash diagnostics:"
+                   << s_CrashStackGuaranteeError;
+    }
+#endif
 #ifdef HAVE_FFMPEG
     av_log_set_callback(ffmpegLogToDiskHandler);
 #endif
 
 #ifdef Q_OS_WIN32
     // Create a crash dump when we crash on Windows
+    pruneOldMinidumps(crashDumpDirectory);
     SetUnhandledExceptionFilter(UnhandledExceptionHandler);
 #endif
 
 #ifdef LOG_TO_FILE
     // Prune the oldest existing logs if there are more than 10
-    QStringList existingLogNames = tempDir.entryList(QStringList("Moonlight-*.log"), QDir::NoFilter, QDir::SortFlag::Time);
+    QStringList existingLogNames = logDir.entryList(QStringList("Moonlight-*.log"), QDir::Files, QDir::SortFlag::Time);
     for (int i = 10; i < existingLogNames.size(); i++) {
         qInfo() << "Removing old log file:" << existingLogNames.at(i);
-        QFile(tempDir.filePath(existingLogNames.at(i))).remove();
+        QFile(logDir.filePath(existingLogNames.at(i))).remove();
     }
 #endif
 
@@ -674,20 +996,21 @@ int main(int argc, char *argv[])
     }
 #endif
 
-#if !defined(Q_OS_WIN32) || QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    // Moonlight requires the non-threaded renderer because we depend
-    // on being able to control the render thread by blocking in the
-    // main thread (and pumping events from the main thread when needed).
-    // That doesn't work with the threaded renderer which causes all
-    // sorts of odd behavior depending on the platform.
-    //
-    // NB: Windows defaults to the "windows" non-threaded render loop on
-    // Qt 5 and the threaded render loop on Qt 6.
-    qputenv("QSG_RENDER_LOOP", "basic");
+#if !defined(Q_OS_WIN32)
+    // Other platforms retain the established non-threaded behavior because
+    // streaming code may block the main thread while pumping events.
+    if (!qEnvironmentVariableIsSet("QSG_RENDER_LOOP")) {
+        qputenv("QSG_RENDER_LOOP", "basic");
+    }
 #endif
 
-#if defined(Q_OS_DARWIN) && defined(QT_DEBUG)
-    // Enable Metal valiation for debug builds
+#if defined(Q_OS_DARWIN) && defined(QT_DEBUG) && !defined(HAVE_LIBPLACEBO_VULKAN)
+    // Enable Metal valiation for debug builds without libplacebo
+    //
+    // The current MoltenVK driver as of Vulkan SDK 1.4.350 triggers Metal debug layer
+    // violations on frame and overlay uploads like:
+    // _validateReplaceRegion:252: failed assertion `Replace Region Validation
+    // bytesPerRow(4803) must be a multiple of MTLPixelFormatBGRA8Unorm pixel bytes(4).
     qputenv("MTL_DEBUG_LAYER", "1");
     qputenv("MTL_SHADER_VALIDATION", "1");
 #endif
@@ -706,6 +1029,14 @@ int main(int argc, char *argv[])
     // and SDL_EnableScreenSaver() when appropriate. This hint must be set before
     // initializing the SDL video subsystem to have any effect.
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+
+#ifdef Q_OS_DARWIN
+    // SDL reads this hint when the video subsystem is first initialized. Set
+    // the saved preference here so the hardware capability probe cannot lock
+    // in the default mouse-only behavior before a streaming session starts.
+    SDL_SetHint(SDL_HINT_TRACKPAD_IS_TOUCH_ONLY,
+                StreamingPreferences::get()->enableNativeTouchpad ? "1" : "0");
+#endif
 
     // We use MMAL to render on Raspberry Pi, so we do not require DRM master.
     SDL_SetHint(SDL_HINT_KMSDRM_REQUIRE_DRM_MASTER, "0");
@@ -761,12 +1092,8 @@ int main(int argc, char *argv[])
     // Set our app name for SDL to use with PulseAudio and PipeWire. This matches what we
     // provide as our app name to libsoundio too. On SDL 2.0.18+, SDL_APP_NAME is also used
     // for screensaver inhibitor reporting.
-    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_APP_NAME, "Moonlight");
-    SDL_SetHint(SDL_HINT_APP_NAME, "Moonlight");
-
-    // We handle capturing the mouse ourselves when it leaves the window, so we don't need
-    // SDL doing it for us behind our backs.
-    SDL_SetHint(SDL_HINT_MOUSE_AUTO_CAPTURE, "0");
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_APP_NAME, "Moonlight V+ for PC");
+    SDL_SetHint(SDL_HINT_APP_NAME, "Moonlight V+ for PC");
 
     // SDL will try to lock the mouse cursor on Wayland if it's not visible in order to
     // support applications that assume they can warp the cursor (which isn't possible
@@ -804,6 +1131,17 @@ int main(int argc, char *argv[])
     }
 
     QGuiApplication app(argc, argv);
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("Moonlight V+ for PC"));
+
+#ifdef Q_OS_DARWIN
+    // macOS defaults "Keyboard navigation" to text fields and lists only, which
+    // prevents Tab (and the gamepad navigation that synthesizes it) from moving
+    // focus between non-text controls on the settings page. Force Tab to reach
+    // all controls so keyboard and gamepad UI navigation work without requiring
+    // the user to enable a system accessibility setting. Other platforms already
+    // default to this behavior.
+    app.styleHints()->setTabFocusBehavior(Qt::TabFocusAllControls);
+#endif
 
 #ifdef Q_OS_UNIX
     // Register signal handlers to arbitrate between SDL and Qt.
@@ -946,27 +1284,6 @@ int main(int argc, char *argv[])
     // Move the mouse to the bottom right so it's invisible when using
     // gamepad-only navigation.
     QCursor().setPos(0xFFFF, 0xFFFF);
-#elif defined(Q_OS_WIN32)
-    const QStringList fontFamilies = QFontDatabase::families();
-    QString defaultFontFamily = QStringLiteral("Segoe UI");
-
-    if (shouldUseChineseWindowsUiFont(StreamingPreferences::get()->language)) {
-        if (fontFamilies.contains(QStringLiteral("Microsoft YaHei UI"))) {
-            defaultFontFamily = QStringLiteral("Microsoft YaHei UI");
-        }
-        else if (fontFamilies.contains(QStringLiteral("Microsoft YaHei"))) {
-            defaultFontFamily = QStringLiteral("Microsoft YaHei");
-        }
-    }
-
-    QFont defaultFont(defaultFontFamily, 9);
-    defaultFont.setStyleHint(QFont::SansSerif);
-    if (fontFamilies.contains(defaultFontFamily)) {
-        app.setFont(defaultFont);
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Set default font to %s", qPrintable(defaultFontFamily));
-    } else {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "%s font not found, using system default", qPrintable(defaultFontFamily));
-    }
 #elif !SDL_VERSION_ATLEAST(2, 0, 11) && defined(Q_OS_LINUX) && (defined(__arm__) || defined(__aarch64__))
     if (qgetenv("SDL_VIDEO_GL_DRIVER").isEmpty() && QGuiApplication::platformName() == "eglfs") {
         // Look for Raspberry Pi GLES libraries. SDL 2.0.10 and earlier needs some help finding
@@ -1018,6 +1335,23 @@ int main(int argc, char *argv[])
                                                [](QQmlEngine*, QJSEngine*) -> QObject* {
                                                    return new SystemProperties();
                                                });
+    qmlRegisterSingletonType<UsbForwardingEnvironment>("UsbForwardingEnvironment", 1, 0,
+                                                       "UsbForwardingEnvironment",
+                                                       [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                           /* Static singleton; QML must not delete it. */
+                                                           QQmlEngine::setObjectOwnership(
+                                                               UsbForwardingEnvironment::get(),
+                                                               QQmlEngine::CppOwnership);
+                                                           return UsbForwardingEnvironment::get();
+                                                       });
+    qmlRegisterSingletonType<UsbForwardingBackend>("UsbForwardingBackend", 1, 0,
+                                                   "UsbForwardingBackend",
+                                                   [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                       QQmlEngine::setObjectOwnership(
+                                                           UsbForwardingBackend::get(),
+                                                           QQmlEngine::CppOwnership);
+                                                       return UsbForwardingBackend::get();
+                                                   });
     qmlRegisterSingletonType<SdlGamepadKeyNavigation>("SdlGamepadKeyNavigation", 1, 0,
                                                       "SdlGamepadKeyNavigation",
                                                       [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
@@ -1029,28 +1363,157 @@ int main(int argc, char *argv[])
                                                        return StreamingPreferences::get(qmlEngine);
                                                    });
     qmlRegisterType<ImageUtils>("ImageUtils", 1, 0, "ImageUtils");
+    qmlRegisterType<WindowPlacement>("WindowPlacement", 1, 0, "WindowPlacement");
+    qmlRegisterType<WindowsWindowChrome>("WindowsWindowChrome", 1, 0, "WindowsWindowChrome");
 
     // Create the identity manager on the main thread
     IdentityManager::get();
 
-    // We require the Material theme
-    QQuickStyle::setStyle("Material");
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+    // Qt 6.8+ ships the FluentWinUI3 style, which is what our settings UI is designed
+    // around. It picks light/dark from the application color scheme (there is no env
+    // var equivalent to the Material ones), and our icons are styled for a dark theme,
+    // so we force dark here rather than following the system.
+    //
+    // Not every distro ships the FluentWinUI3 QML with its Qt (Ubuntu 26.04
+    // doesn't): hard-setting it there makes the whole QML tree fail to load,
+    // and Fusion leaves half the controls light-on-dark. Fall back to the
+    // dark Material setup when the style is not actually available.
+    if (styleQmlAvailable(QStringLiteral("FluentWinUI3"))) {
+        QQuickStyle::setStyle("FluentWinUI3");
+        QGuiApplication::styleHints()->setColorScheme(Qt::ColorScheme::Dark);
 
-    // Our icons are styled for a dark theme, so we do not allow the user to override this
-    qputenv("QT_QUICK_CONTROLS_MATERIAL_THEME", "Dark");
+        // Unlike the Material style, FluentWinUI3 takes all of its colors from the
+        // application palette: ApplicationWindow is literally "color: palette.window",
+        // and the checked color of check boxes, switches, sliders and progress bars
+        // comes from palette.accent. setColorScheme() above only swaps the style's own
+        // assets; on macOS the palette still follows the system appearance, so under a
+        // light system theme every page we haven't restyled ourselves (the connection
+        // spinner, the legacy settings groups) renders as white-on-white.
+        //
+        // Force a dark palette built from the alkaidlab.com design variables so the
+        // whole app is consistent regardless of the system appearance.
+        {
+            const QColor background(0x0F, 0x17, 0x2A); // --background-darker
+            const QColor surface(0x1E, 0x29, 0x3B);    // --background-dark
+            const QColor border(0x33, 0x41, 0x55);     // --border-dark
+            const QColor text(0xF1, 0xF5, 0xF9);
+            const QColor textMuted(0x94, 0xA3, 0xB8); // --text-muted
+            const QColor accent(0x39, 0xC5, 0xBB);    // --primary-color
 
-    // These are defaults that we allow the user to override
-    if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_ACCENT")) {
-        qputenv("QT_QUICK_CONTROLS_MATERIAL_ACCENT", "Purple");
+            QPalette palette;
+            palette.setColor(QPalette::Window, background);
+            palette.setColor(QPalette::WindowText, text);
+            palette.setColor(QPalette::Base, surface);
+            palette.setColor(QPalette::AlternateBase, border);
+            palette.setColor(QPalette::Text, text);
+            palette.setColor(QPalette::Button, surface);
+            palette.setColor(QPalette::ButtonText, text);
+            palette.setColor(QPalette::BrightText, text);
+            palette.setColor(QPalette::ToolTipBase, surface);
+            palette.setColor(QPalette::ToolTipText, text);
+            palette.setColor(QPalette::PlaceholderText, textMuted);
+            palette.setColor(QPalette::Mid, border);
+            palette.setColor(QPalette::Dark, background);
+            palette.setColor(QPalette::Light, border);
+            palette.setColor(QPalette::Midlight, border);
+            palette.setColor(QPalette::Shadow, background);
+            palette.setColor(QPalette::Accent, accent);
+            palette.setColor(QPalette::Highlight, accent);
+            palette.setColor(QPalette::HighlightedText, background);
+            palette.setColor(QPalette::Link, accent);
+            palette.setColor(QPalette::LinkVisited, accent);
+
+            palette.setColor(QPalette::Disabled, QPalette::WindowText, textMuted);
+            palette.setColor(QPalette::Disabled, QPalette::Text, textMuted);
+            palette.setColor(QPalette::Disabled, QPalette::ButtonText, textMuted);
+
+            QGuiApplication::setPalette(palette);
+        }
+    } else {
+        configureMaterialFallback();
     }
-    if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_VARIANT")) {
-        qputenv("QT_QUICK_CONTROLS_MATERIAL_VARIANT", "Dense");
-    }
-    if (!qEnvironmentVariableIsSet("QT_QUICK_CONTROLS_MATERIAL_PRIMARY")) {
-        // Qt 6.9 began to use a different shade of Material.Indigo when we use a dark theme
-        // (which is all the time). The new color looks washed out, so manually specify the
-        // old primary color unless the user overrides it themselves.
-        qputenv("QT_QUICK_CONTROLS_MATERIAL_PRIMARY", "#3F51B5");
+#else
+    // Fall back to the Material theme on older Qt builds
+    configureMaterialFallback();
+#endif
+
+    // 界面字体：Manrope（正文/标题）+ DM Mono（数字、状态徽标、宽字距微标签），
+    // 这是 neo-brutalism 视觉的一半，见 app/res/fonts/README.md。
+    //
+    {
+        static const char* const kBundledFonts[] = {
+            ":/res/fonts/Manrope-Regular.ttf",
+            ":/res/fonts/Manrope-SemiBold.ttf",
+            ":/res/fonts/Manrope-ExtraBold.ttf",
+            ":/res/fonts/DMMono-Regular.ttf",
+        };
+
+        bool haveManrope = false;
+        for (const char* path : kBundledFonts) {
+            if (QFontDatabase::addApplicationFont(QLatin1String(path)) < 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to load bundled font: %s", path);
+            }
+            else if (QLatin1String(path).startsWith(QLatin1String(":/res/fonts/Manrope-"))) {
+                haveManrope = true;
+            }
+        }
+
+        QFont uiFont = app.font();
+
+#ifdef Q_OS_WIN32
+        const QStringList installedFamilies = QFontDatabase::families();
+        QString defaultFontFamily = QStringLiteral("Segoe UI");
+        if (shouldUseChineseWindowsUiFont(StreamingPreferences::get()->language)) {
+            for (const QString& family : UiFont::systemHanFallbackFamilies()) {
+                if (installedFamilies.contains(family)) {
+                    defaultFontFamily = family;
+                    break;
+                }
+            }
+        }
+
+        if (installedFamilies.contains(defaultFontFamily)) {
+            uiFont.setFamily(defaultFontFamily);
+            uiFont.setPointSize(9);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Set default font to %s", qPrintable(defaultFontFamily));
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "%s font not found, using system default", qPrintable(defaultFontFamily));
+        }
+#endif
+
+        if (haveManrope) {
+            // Manrope 和 DM Mono 都没有中文字形，中文交给系统字体回退。
+            // Qt 会跳过列表里不存在的 family，所以这里可以无条件把候选都列上。
+            QStringList families = UiFont::familyChain(QStringLiteral("Manrope"));
+            // 最后兜住原本的系统默认字体，别把上面平台分支设好的字号/字形提示丢了
+            families << uiFont.family();
+            uiFont.setFamilies(families);
+            uiFont.setStyleHint(QFont::SansSerif);
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0) && defined(Q_OS_WIN32)
+            // QML controls frequently select Manrope or DM Mono directly.
+            // That replaces the default font's family list, so Windows may
+            // choose SimSun for missing Han glyphs. Pin the application-wide
+            // Han fallback to modern sans-serif fonts instead.
+            QStringList hanFallbackFamilies;
+            for (const QString &family : UiFont::systemHanFallbackFamilies()) {
+                if (installedFamilies.contains(family)) {
+                    hanFallbackFamilies << family;
+                }
+            }
+            if (!hanFallbackFamilies.isEmpty()) {
+                QFontDatabase::setApplicationFallbackFontFamilies(QChar::Script_Han,
+                                                                  hanFallbackFamilies);
+            }
+#endif
+
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "UI font families: %s",
+                        qPrintable(families.join(QLatin1String(", "))));
+        }
+
+        app.setFont(uiFont);
     }
 
     QQmlApplicationEngine engine;
@@ -1110,6 +1573,18 @@ int main(int argc, char *argv[])
         engine.load(QUrl(QStringLiteral("qrc:/gui/main.qml")));
         if (engine.rootObjects().isEmpty())
             return -1;
+
+#ifdef Q_OS_DARWIN
+        // 主界面去掉了系统标题栏的底色，那条 56px 的工具栏就是标题栏。但系统的标题栏
+        // 带子仍然只有 28~32pt 高：红绿灯挤在最上面一小条里，而 AppKit 也只在那条带子
+        // 里提供窗口拖动和双击缩放，工具栏下半部分是拖不动的。把带子拉高到 56，
+        // 红绿灯落到 bar 的中线上，拖动区也就覆盖了整条 bar。
+        //
+        // 56 要和 main.qml 里 toolBar 的 height 保持一致。
+        if (auto* rootWindow = qobject_cast<QWindow*>(engine.rootObjects().first())) {
+            MacWindowChrome::useTallTitleBar(rootWindow, 56);
+        }
+#endif
     }
 
     int err = app.exec();

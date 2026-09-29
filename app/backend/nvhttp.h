@@ -4,6 +4,7 @@
 #include "nvapp.h"
 #include "nvaddress.h"
 #include "remotecomputer.h"
+#include "usbforwardingcapability.h"
 
 #include <Limelight.h>
 
@@ -12,6 +13,8 @@
 #include <QNetworkReply>
 #include <QJsonObject>
 #include <QVariant>
+
+#include <optional>
 
 class NvComputer;
 
@@ -112,7 +115,7 @@ public:
         NVLL_VERBOSE
     };
 
-    explicit NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, QNetworkAccessManager* nam = nullptr, QString uuid = "");
+    explicit NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, bool useTrueUid = false, QNetworkAccessManager* nam = nullptr, QString uuid = "");
 
     explicit NvHTTP(NvComputer* computer, QNetworkAccessManager* nam = nullptr);
 
@@ -144,6 +147,8 @@ public:
                            int timeoutMs,
                            NvLogLevel logLevel = NvLogLevel::NVLL_VERBOSE);
 
+    UsbForwarding::Capability getUsbForwardingCapability();
+
     bool
     getAbrCapabilities(int* hostMaxBitrateKbps = nullptr);
 
@@ -163,9 +168,10 @@ public:
                     int timeoutMs = 2000);
 
     void setServerCert(QSslCertificate serverCert);
-
     void setAddress(NvAddress address);
     void setHttpsPort(uint16_t port);
+    void setTrueUid(bool useTrueUid);
+    void setHostUuid(QString uuid);
 
     NvAddress address();
 
@@ -192,8 +198,9 @@ public:
              int gamepadMask,
              bool persistGameControllersOnDisconnect,
              QString& rtspSessionUrl,
-             int customScreenMode,
-             int customVddScreenMode,
+             int screenCombinationMode,
+             const std::optional<bool>& useVdd,
+             const QString& displayName,
              RemoteStreamConfig &remoteStreamConfig);
 
     QVector<NvApp>
@@ -220,7 +227,8 @@ private:
                    QString command,
                    QString arguments,
                    int timeoutMs,
-                   NvLogLevel logLevel);
+                   NvLogLevel logLevel,
+                   qint64 maxResponseBytes = 0);
 
     QNetworkReply*
     openJsonConnection(QUrl baseUrl,
@@ -241,5 +249,6 @@ private:
     NvAddress m_Address;
     QNetworkAccessManager* m_Nam;
     QSslCertificate m_ServerCert;
+    bool m_UseTrueUid;
     QString m_Uuid;
 };

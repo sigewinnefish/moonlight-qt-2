@@ -52,6 +52,7 @@ private:
                                 bool useAlternateFrontend);
 
     void stringifyVideoStats(VIDEO_STATS& stats, char* output, int length);
+    const char* dynamicRangeLabel();
 
     void logVideoStats(VIDEO_STATS& stats, const char* title);
 
@@ -87,7 +88,7 @@ private:
                                IFFmpegRenderer::InitFailureReason* failureReason,
                                std::function<IFFmpegRenderer*()> createRendererFunc);
 
-    static IFFmpegRenderer* createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass);
+    static IFFmpegRenderer* createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, PDECODER_PARAMETERS params, int pass);
 
     bool initializeRendererInternal(IFFmpegRenderer* renderer, PDECODER_PARAMETERS params);
 
@@ -129,6 +130,8 @@ private:
     int m_OriginalVideoHeight;
     int m_VideoFormat;
     bool m_NeedsSpsFixup;
+    bool m_NeedsAv1ObuRepack;
+    bool m_LoggedHdr10PlusMetadata;
     bool m_TestOnly;
     TestMode m_CurrentTestMode;
     SDL_Thread* m_DecoderThread;

@@ -51,7 +51,31 @@ SystemProperties::SystemProperties()
     hasDesktopEnvironment = WMUtils::isRunningDesktopEnvironment();
     isRunningWayland = WMUtils::isRunningWayland();
     isRunningXWayland = isRunningWayland && QGuiApplication::platformName() == "xcb";
-    usesMaterial3Theme = QLibraryInfo::version() >= QVersionNumber(6, 5, 0);
+    // Keep in sync with the style selection in main.cpp
+    usesFluentTheme = QLibraryInfo::version() >= QVersionNumber(6, 8, 0);
+    usesMaterial3Theme = !usesFluentTheme && QLibraryInfo::version() >= QVersionNumber(6, 5, 0);
+
+#ifdef Q_OS_DARWIN
+    isDarwin = true;
+#else
+    isDarwin = false;
+#endif
+
+#ifdef Q_OS_LINUX
+    isLinux = true;
+#else
+    isLinux = false;
+#endif
+
+#if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || defined(Q_OS_LINUX)
+    // Windows attaches to an external usbipd-win server; macOS ships the
+    // moonlight-usbd helper (usbipdcpp) inside the app bundle; Linux wraps
+    // the standard usbip-host kernel stack (usbip + usbipd daemon).
+    // The Android service is future work; see the platform table in
+    // docs/remote-usb-reverse-tunnel.md.
+    usbForwardingAvailable = true;
+#endif
+
     QString nativeArch = QSysInfo::currentCpuArchitecture();
 
 #ifdef Q_OS_WIN32
@@ -142,21 +166,18 @@ void SystemProperties::updateDecoderProperties(bool hasHardwareAcceleration, boo
 QRect SystemProperties::getNativeResolution(int displayIndex)
 {
     // Returns default constructed QRect if out of bounds
-    Q_ASSERT(!monitorNativeResolutions.isEmpty());
     return monitorNativeResolutions.value(displayIndex);
 }
 
 QRect SystemProperties::getSafeAreaResolution(int displayIndex)
 {
     // Returns default constructed QRect if out of bounds
-    Q_ASSERT(!monitorSafeAreaResolutions.isEmpty());
     return monitorSafeAreaResolutions.value(displayIndex);
 }
 
 int SystemProperties::getRefreshRate(int displayIndex)
 {
     // Returns 0 if out of bounds
-    Q_ASSERT(!monitorRefreshRates.isEmpty());
     return monitorRefreshRates.value(displayIndex);
 }
 
@@ -222,6 +243,8 @@ void SystemProperties::refreshDisplays()
     }
 
     monitorNativeResolutions.clear();
+    monitorSafeAreaResolutions.clear();
+    monitorRefreshRates.clear();
 
     SDL_DisplayMode bestMode;
     for (int displayIndex = 0; displayIndex < SDL_GetNumVideoDisplays(); displayIndex++) {
@@ -230,8 +253,11 @@ void SystemProperties::refreshDisplays()
 
         if (StreamUtils::getNativeDesktopMode(displayIndex, &desktopMode, &safeArea)) {
             if (desktopMode.w <= 8192 && desktopMode.h <= 8192) {
-                monitorNativeResolutions.insert(displayIndex, QRect(0, 0, desktopMode.w, desktopMode.h));
-                monitorSafeAreaResolutions.insert(displayIndex, QRect(0, 0, safeArea.w, safeArea.h));
+                // Keep these lists compact because their QML consumers iterate until
+                // the first empty entry. Inserting by SDL display index is invalid if
+                // an earlier display was skipped (for example, a >8K virtual display).
+                monitorNativeResolutions.append(QRect(0, 0, desktopMode.w, desktopMode.h));
+                monitorSafeAreaResolutions.append(QRect(0, 0, safeArea.w, safeArea.h));
             }
             else {
                 SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,

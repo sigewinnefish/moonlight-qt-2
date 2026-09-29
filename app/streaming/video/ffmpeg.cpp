@@ -1,5 +1,6 @@
 #include <Limelight.h>
 #include "ffmpeg.h"
+#include "av1obu.h"
 #include "utils.h"
 #include "streaming/session.h"
 #include "streaming/network/bandwidth.h"
@@ -152,6 +153,15 @@ int FFmpegVideoDecoder::getDecoderCapabilities()
     // our operation.
     capabilities |= CAPABILITY_PULL_RENDERER;
 
+    // moonlight-common-c strips HEVC prefix SEI by default, because renderers that
+    // hand raw NALUs to a platform decoder have historically choked on NALUs
+    // arriving ahead of VPS/SPS/PPS. Every decoder this class can select consumes
+    // an FFmpeg AVPacket instead, and FFmpeg's HEVC parser is happy to skip SEI it
+    // does not understand, so we can opt back in. Keeping the SEI is what lets
+    // FFmpeg surface registered ITU-T T.35 payloads (HDR10+ among them) as frame
+    // side data.
+    capabilities |= CAPABILITY_PRESERVE_HEVC_SEI;
+
     return capabilities;
 }
 
@@ -234,6 +244,8 @@ FFmpegVideoDecoder::FFmpegVideoDecoder(bool testOnly)
       m_StreamFps(0),
       m_VideoFormat(0),
       m_NeedsSpsFixup(false),
+      m_NeedsAv1ObuRepack(false),
+      m_LoggedHdr10PlusMetadata(false),
       m_TestOnly(testOnly),
       m_CurrentTestMode(TestMode::TestFrameOnly),
       m_DecoderThread(nullptr),
@@ -369,7 +381,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             if (!vulkanIsSlow) {
                 // The Vulkan renderer can also handle HDR with a supported compositor. We prefer
                 // rendering HDR with Vulkan if possible since it's more fully featured than DRM.
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
                 }
@@ -397,7 +409,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             if (vulkanIsSlow) {
                 // Try Vulkan even if it's slow because we have no other renderer
                 // that can display HDR properly on Linux.
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
                 }
@@ -410,7 +422,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
         {
 #ifdef HAVE_LIBPLACEBO_VULKAN
             if (qgetenv("PREFER_VULKAN") == "1") {
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params)) {
                     return true;
                 }
@@ -724,6 +736,20 @@ bool FFmpegVideoDecoder::completeInitialization(const AVCodec* decoder, enum AVP
             m_NeedsSpsFixup = false;
         }
 
+        // macOS VideoToolbox fails every frame with kVTVideoDecoderMalfunctionErr
+        // when NVENC splits an AV1 frame into OBU_FRAME_HEADER + OBU_TILE_GROUP,
+        // which it does for HDR (but not SDR). Merge them back into an OBU_FRAME
+        // before handing the packet to the decoder.
+        if ((params->videoFormat & VIDEO_FORMAT_MASK_AV1) && m_HwDecodeCfg != nullptr &&
+                m_HwDecodeCfg->device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Using AV1 OBU repack for VideoToolbox");
+            m_NeedsAv1ObuRepack = true;
+        }
+        else {
+            m_NeedsAv1ObuRepack = false;
+        }
+
         // Tell overlay manager to use this frontend renderer
         Session::get()->getOverlayManager().setOverlayRenderer(m_FrontendRenderer);
 
@@ -803,10 +829,32 @@ void FFmpegVideoDecoder::addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst)
     dst.renderedFps     = (double)dst.renderedFrames / timeDiffSecs;
 }
 
+// The dynamic range slot of the codec string in the performance overlay.
+//
+// "HDR10+" means the frontend renderer is actually tone mapping against ST 2094-40
+// this frame, not merely that the bitstream carried it: a renderer that ignores the
+// metadata, or a payload libplacebo couldn't map, both stay at "HDR".
+const char* FFmpegVideoDecoder::dynamicRangeLabel()
+{
+    if (!LiGetCurrentHostDisplayHdrMode()) {
+        return "SDR";
+    }
+
+    // NB: logVideoStats() runs during cleanup, after the renderers have been deleted
+    // and nulled, so this can legitimately be called with no renderer at all.
+    if (m_FrontendRenderer != nullptr &&
+            m_FrontendRenderer->getActiveToneMappingSource() == IFFmpegRenderer::ToneMappingSource::Hdr10Plus) {
+        return "HDR10+";
+    }
+
+    return "HDR";
+}
+
 void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS &stats, char *output, int length)
 {
     int offset = 0;
     const char *codecString;
+    char codecStringBuffer[32];
     int ret;
 
     // Start with an empty string
@@ -831,25 +879,13 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS &stats, char *output, i
         break;
 
     case VIDEO_FORMAT_H265_MAIN10:
-        if (LiGetCurrentHostDisplayHdrMode())
-        {
-            codecString = "HEVC 10-bit HDR";
-        }
-        else
-        {
-            codecString = "HEVC 10-bit SDR";
-        }
+        snprintf(codecStringBuffer, sizeof(codecStringBuffer), "HEVC 10-bit %s", dynamicRangeLabel());
+        codecString = codecStringBuffer;
         break;
 
     case VIDEO_FORMAT_H265_REXT10_444:
-        if (LiGetCurrentHostDisplayHdrMode())
-        {
-            codecString = "HEVC 10-bit HDR 4:4:4";
-        }
-        else
-        {
-            codecString = "HEVC 10-bit SDR 4:4:4";
-        }
+        snprintf(codecStringBuffer, sizeof(codecStringBuffer), "HEVC 10-bit %s 4:4:4", dynamicRangeLabel());
+        codecString = codecStringBuffer;
         break;
 
     case VIDEO_FORMAT_AV1_MAIN8:
@@ -861,25 +897,13 @@ void FFmpegVideoDecoder::stringifyVideoStats(VIDEO_STATS &stats, char *output, i
         break;
 
     case VIDEO_FORMAT_AV1_MAIN10:
-        if (LiGetCurrentHostDisplayHdrMode())
-        {
-            codecString = "AV1 10-bit HDR";
-        }
-        else
-        {
-            codecString = "AV1 10-bit SDR";
-        }
+        snprintf(codecStringBuffer, sizeof(codecStringBuffer), "AV1 10-bit %s", dynamicRangeLabel());
+        codecString = codecStringBuffer;
         break;
 
     case VIDEO_FORMAT_AV1_HIGH10_444:
-        if (LiGetCurrentHostDisplayHdrMode())
-        {
-            codecString = "AV1 10-bit HDR 4:4:4";
-        }
-        else
-        {
-            codecString = "AV1 10-bit SDR 4:4:4";
-        }
+        snprintf(codecStringBuffer, sizeof(codecStringBuffer), "AV1 10-bit %s 4:4:4", dynamicRangeLabel());
+        codecString = codecStringBuffer;
         break;
 
     default:
@@ -1011,8 +1035,10 @@ void FFmpegVideoDecoder::logVideoStats(VIDEO_STATS& stats, const char* title)
     }
 }
 
-IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass)
+IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, PDECODER_PARAMETERS params, int pass)
 {
+    Q_UNUSED(params);
+
     if (!(hwDecodeCfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
         return nullptr;
     }
@@ -1028,8 +1054,19 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-            // Prefer the Metal renderer if hardware is compatible
-            return VTMetalRendererFactory::createRenderer(true);
+            // Prefer the libplacebo (on MoltenVK) renderer unless explicitly opted out
+#ifdef HAVE_LIBPLACEBO_VULKAN
+            if (params->renderer == StreamingPreferences::RS_AUTO || params->renderer == StreamingPreferences::RS_VULKAN) {
+                return new PlVkRenderer(hwDecodeCfg->device_type);
+            }
+#endif
+            if (params->renderer == StreamingPreferences::RS_AVSBDL) {
+                return VTRendererFactory::createRenderer();
+            }
+            else {
+                // This covers both Metal explicitly selected and probe-only (since Metal is cheap to instantiate)
+                return VTMetalRendererFactory::createRenderer(true);
+            }
 #endif
 #ifdef HAVE_LIBVA
         case AV_HWDEVICE_TYPE_VAAPI:
@@ -1045,7 +1082,7 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef HAVE_LIBPLACEBO_VULKAN
         case AV_HWDEVICE_TYPE_VULKAN:
-            return new PlVkRenderer(true);
+            return new PlVkRenderer(hwDecodeCfg->device_type);
 #endif
         default:
             switch (hwDecodeCfg->pix_fmt) {
@@ -1190,10 +1227,10 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
         *failureReason = IFFmpegRenderer::InitFailureReason::Unknown;
     }
 
-    // i == 0 - Indirect via EGL or DRM frontend with zero-copy DMA-BUF passing
-    // i == 1 - Direct rendering or indirect via SDL read-back
+    // i == 0 - Indirect via EGL, DRM, or Vulkan frontend with zero-copy buffer passing
+    // i == 1 - Direct rendering or indirect via SDL or DRM read-back
     bool backendInitFailure = false;
-#ifdef HAVE_EGL
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN) && (defined(HAVE_EGL) || defined(HAVE_DRM) || defined(HAVE_LIBPLACEBO_VULKAN))
     for (int i = 0; i < 2 && !backendInitFailure; i++) {
 #else
     for (int i = 1; i < 2 && !backendInitFailure; i++) {
@@ -1352,7 +1389,7 @@ bool FFmpegVideoDecoder::tryInitializeRendererForUnknownDecoder(const AVCodec* d
                 // Initialize the hardware codec and submit a test frame if the renderer needs it
                 IFFmpegRenderer::InitFailureReason failureReason;
                 if (tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, config, &failureReason,
-                                          [config, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, pass); })) {
+                                          [config, params, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, params, pass); })) {
                     return true;
                 }
                 else if (failureReason == IFFmpegRenderer::InitFailureReason::NoHardwareSupport) {
@@ -1552,7 +1589,7 @@ bool FFmpegVideoDecoder::tryInitializeHwAccelDecoder(PDECODER_PARAMETERS params,
             // Initialize the hardware codec and submit a test frame if the renderer needs it
             IFFmpegRenderer::InitFailureReason failureReason;
             if (tryInitializeRenderer(decoder, AV_PIX_FMT_NONE, params, config, &failureReason,
-                                      [config, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, pass); })) {
+                                      [config, params, pass]() -> IFFmpegRenderer* { return createHwAccelRenderer(config, params, pass); })) {
                 return true;
             }
             else if (failureReason == IFFmpegRenderer::InitFailureReason::NoHardwareSupport) {
@@ -1773,6 +1810,7 @@ void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
     if (m_NeedsSpsFixup && entry->bufferType == BUFFER_TYPE_SPS) {
         h264_stream_t* stream = h264_new();
         int nalStart, nalEnd;
+        bool needsFixup;
 
         // Read the old NALU
         find_nal_unit((uint8_t*)entry->data, entry->length, &nalStart, &nalEnd);
@@ -1785,33 +1823,60 @@ void FFmpegVideoDecoder::writeBuffer(PLENTRY entry, int& offset)
 
         // Fixup the SPS to what OS X needs to use hardware acceleration
         // This is also critical for decoding latency on the Pi 2.
-        stream->sps->num_ref_frames = 1;
-        stream->sps->vui.max_dec_frame_buffering = 1;
+        needsFixup = (stream->sps->num_ref_frames != 1 || stream->sps->vui.max_dec_frame_buffering != 1);
+#ifndef QT_DEBUG
+        if (needsFixup)
+#endif
+        {
+            stream->sps->num_ref_frames = 1;
+            stream->sps->vui.max_dec_frame_buffering = 1;
 
-        // NVENC doesn't seem to add bitstream restrictions anymore (591.59),
-        // so we need to add them ourselves if not present to ensure that
-        // the max_dec_frame_buffering option actually takes effect.
-        // We use the defaults for everything except max_dec_frame_buffering.
-        if (!stream->sps->vui.bitstream_restriction_flag) {
-            stream->sps->vui.bitstream_restriction_flag = 1;
-            stream->sps->vui.motion_vectors_over_pic_boundaries_flag = 1;
-            stream->sps->vui.max_bytes_per_pic_denom = 2;
-            stream->sps->vui.max_bits_per_mb_denom = 1;
-            stream->sps->vui.log2_max_mv_length_horizontal = 16;
-            stream->sps->vui.log2_max_mv_length_vertical = 16;
-            stream->sps->vui.num_reorder_frames = 0;
+            // NVENC doesn't seem to add bitstream restrictions anymore (591.59),
+            // so we need to add them ourselves if not present to ensure that
+            // the max_dec_frame_buffering option actually takes effect.
+            // We use the defaults for everything except max_dec_frame_buffering.
+            if (!stream->sps->vui.bitstream_restriction_flag) {
+                stream->sps->vui.bitstream_restriction_flag = 1;
+                stream->sps->vui.motion_vectors_over_pic_boundaries_flag = 1;
+                stream->sps->vui.max_bytes_per_pic_denom = 2;
+                stream->sps->vui.max_bits_per_mb_denom = 1;
+                stream->sps->vui.log2_max_mv_length_horizontal = 16;
+                stream->sps->vui.log2_max_mv_length_vertical = 16;
+                stream->sps->vui.num_reorder_frames = 0;
+            }
+
+            int initialOffset = offset;
+
+            // Copy the modified NALU data. This clobbers byte 0 and starts NALU data at byte 1.
+            // Since it prepended one extra byte, subtract one from the returned length.
+            offset += write_nal_unit(stream, (uint8_t*)&m_DecodeBuffer.data()[initialOffset + nalStart - 1],
+                                     MAX_SPS_EXTRA_SIZE + entry->length - nalStart) - 1;
+
+            // Copy the NALU prefix over from the original SPS
+            memcpy(&m_DecodeBuffer.data()[initialOffset], entry->data, nalStart);
+            offset += nalStart;
+
+#ifdef QT_DEBUG
+            // If we didn't need a fixup, the SPS should have stayed the exact same
+            if (!needsFixup) {
+                SDL_assert(offset - initialOffset == entry->length);
+                SDL_assert(memcmp(&m_DecodeBuffer.data()[initialOffset], entry->data, entry->length) == 0);
+            }
+            else {
+                // The SPS should never get smaller with a fixup
+                SDL_assert(offset - initialOffset >= entry->length);
+            }
+#endif
         }
-
-        int initialOffset = offset;
-
-        // Copy the modified NALU data. This clobbers byte 0 and starts NALU data at byte 1.
-        // Since it prepended one extra byte, subtract one from the returned length.
-        offset += write_nal_unit(stream, (uint8_t*)&m_DecodeBuffer.data()[initialOffset + nalStart - 1],
-                                 MAX_SPS_EXTRA_SIZE + entry->length - nalStart) - 1;
-
-        // Copy the NALU prefix over from the original SPS
-        memcpy(&m_DecodeBuffer.data()[initialOffset], entry->data, nalStart);
-        offset += nalStart;
+#ifndef QT_DEBUG
+        else {
+            // Write the SPS as-is if it required no modification
+            memcpy(&m_DecodeBuffer.data()[offset],
+                   entry->data,
+                   entry->length);
+            offset += entry->length;
+        }
+#endif
 
         h264_free(stream);
     }
@@ -1867,6 +1932,26 @@ void FFmpegVideoDecoder::decoderThreadProc()
                 if (err == 0) {
                     SDL_assert(m_FrameInfoQueue.size() == m_FramesIn - m_FramesOut);
                     m_FramesOut++;
+
+                    // Log the first frame that carries ST 2094-40, so a user reporting
+                    // "HDR10+ does nothing" can be told apart from a host that never sent
+                    // any. Once per session is enough; this is the decoder hot path.
+                    //
+                    // Also say whether anything downstream will use it: a renderer that
+                    // reports Unsupported never tone maps HDR itself, so the metadata
+                    // arriving is not the same as the metadata mattering.
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 25, 100)
+                    if (!m_LoggedHdr10PlusMetadata &&
+                            av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS) != nullptr) {
+                        bool rendererUsesIt = m_FrontendRenderer != nullptr &&
+                                m_FrontendRenderer->getActiveToneMappingSource() != IFFmpegRenderer::ToneMappingSource::Unsupported;
+                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                    "Received HDR10+ dynamic metadata from the %s bitstream%s",
+                                    (m_VideoFormat & VIDEO_FORMAT_MASK_AV1) ? "AV1" : "HEVC",
+                                    rendererUsesIt ? "" : " (ignored: the current renderer does not tone map HDR)");
+                        m_LoggedHdr10PlusMetadata = true;
+                    }
+#endif
 
                     // Attach HDR metadata to the frame if it's not already present. We will defer to
                     // any metadata contained in the bitstream itself since that is guaranteed to be
@@ -1925,6 +2010,74 @@ void FFmpegVideoDecoder::decoderThreadProc()
                             frame->crop_right = cropWidth;
                             frame->crop_bottom = cropHeight;
                             av_frame_apply_cropping(frame, 0);
+                        }
+                    }
+
+                    // Some decoders don't propagate color metadata from the bitstream,
+                    // so we will try to guess it here if it was unset.
+                    if (frame->color_range == AVCOL_RANGE_UNSPECIFIED) {
+                        switch (getDecoderColorRange()) {
+                        case COLOR_RANGE_LIMITED:
+                            frame->color_range = AVCOL_RANGE_MPEG;
+                            break;
+                        case COLOR_RANGE_FULL:
+                            frame->color_range = AVCOL_RANGE_JPEG;
+                            break;
+                        }
+                    }
+                    if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
+                        switch (getDecoderColorspace()) {
+                        case COLORSPACE_REC_601:
+                            frame->colorspace = AVCOL_SPC_SMPTE170M;
+                            break;
+                        case COLORSPACE_REC_709:
+                            frame->colorspace = AVCOL_SPC_BT709;
+                            break;
+                        case COLORSPACE_REC_2020:
+                            frame->colorspace = AVCOL_SPC_BT2020_NCL;
+                            break;
+                        }
+
+                        // HDR forces BT.2020 regardless of decoder preference
+                        if (LiGetCurrentHostDisplayHdrMode()) {
+                            frame->colorspace = AVCOL_SPC_BT2020_NCL;
+                        }
+                    }
+                    if (frame->color_primaries == AVCOL_PRI_UNSPECIFIED) {
+                        switch (frame->colorspace) {
+                        case AVCOL_SPC_BT709:
+                            frame->color_primaries = AVCOL_PRI_BT709;
+                            break;
+                        case AVCOL_SPC_SMPTE170M:
+                            frame->color_primaries = AVCOL_PRI_SMPTE170M;
+                            break;
+                        case AVCOL_SPC_BT2020_NCL:
+                        case AVCOL_SPC_BT2020_CL:
+                            frame->color_primaries = AVCOL_PRI_BT2020;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    if (frame->color_trc == AVCOL_TRC_UNSPECIFIED) {
+                        switch (frame->colorspace) {
+                        case AVCOL_SPC_BT709:
+                            frame->color_trc = AVCOL_TRC_BT709;
+                            break;
+                        case AVCOL_SPC_SMPTE170M:
+                            frame->color_trc = AVCOL_TRC_SMPTE170M;
+                            break;
+                        case AVCOL_SPC_BT2020_NCL:
+                        case AVCOL_SPC_BT2020_CL:
+                            frame->color_trc = AVCOL_TRC_BT2020_10;
+                            break;
+                        default:
+                            break;
+                        }
+
+                        // HDR forces SMPTE 2084 PQ regardless of decoder preference
+                        if (LiGetCurrentHostDisplayHdrMode()) {
+                            frame->color_trc = AVCOL_TRC_SMPTE2084;
                         }
                     }
 
@@ -2083,6 +2236,10 @@ int FFmpegVideoDecoder::submitDecodeUnit(PDECODE_UNIT du)
     while (entry != nullptr) {
         writeBuffer(entry, offset);
         entry = entry->next;
+    }
+
+    if (m_NeedsAv1ObuRepack) {
+        offset = repackAv1TemporalUnit(reinterpret_cast<uint8_t*>(m_DecodeBuffer.data()), offset);
     }
 
     m_Pkt->data = reinterpret_cast<uint8_t*>(m_DecodeBuffer.data());

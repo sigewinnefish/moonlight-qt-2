@@ -1,12 +1,11 @@
 #include "clipboardsync.h"
-#include "backend/nvcomputer.h"
-#include "backend/identitymanager.h"
+#include "clipboardlogging.h"
 
 #include <QBuffer>
 #include <QClipboard>
-#include <QDateTime>
 #include <QGuiApplication>
 #include <QImage>
+#include <QImageReader>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
@@ -15,16 +14,24 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QRandomGenerator>
 #include <QSslConfiguration>
 #include <QSslError>
+#include <QTimer>
 #include <QUrl>
 #include <QtEndian>
 
 #include <cstring>
+#include <memory>
+#include <cmath>
 
-#include <SDL.h>
-
-#include <Limelight.h>
+#ifdef Q_OS_MACOS
+extern "C" int ClipboardHelperPasteboardChangeCount();
+extern "C" bool ClipboardHelperWritePasteboardCompound(const char* utf8Text,
+                                                       const unsigned char* pngBytes,
+                                                       int pngLength);
+extern "C" bool ClipboardHelperIsFinderPasteboard();
+#endif
 
 namespace {
 bool isImageLikeMimeFormat(const QString& format)
@@ -76,16 +83,83 @@ bool looksLikePngBytes(const QByteArray& bytes)
 }
 }
 
-ClipboardSync::ClipboardSync(NvComputer* computer, QObject* parent)
+ClipboardSync::ClipboardSync(const ClipboardSyncHostContext& hostContext, QObject* parent)
     : QObject(parent),
-      m_Computer(computer)
+      m_HostContext(hostContext)
 {
     qRegisterMetaType<QByteArray>("QByteArray");
+    m_Clock.start();
+    // Tokens are shared with peers. Avoid every helper restart beginning at 1.
+    m_NextToken = QRandomGenerator::global()->generate();
+    if (m_NextToken == 0) {
+        m_NextToken = 1;
+    }
 }
 
 ClipboardSync::~ClipboardSync()
 {
     stop();
+}
+
+bool ClipboardSync::hasFileReferences(const QMimeData* mime)
+{
+    if (mime == nullptr) {
+        return false;
+    }
+
+    // Qt normalizes ordinary Finder and Explorer file copies to local URLs.
+    // Do not treat remote web URLs as file clipboard data: browsers commonly
+    // attach those to otherwise valid copied images.
+    if (mime->hasUrls()) {
+        const QList<QUrl> urls = mime->urls();
+        for (const QUrl& url : urls) {
+            if (url.isLocalFile()) {
+                return true;
+            }
+        }
+    }
+
+    // Some native and promised-file providers expose only a platform format,
+    // without a URL that QMimeData can normalize. Match the identifying part
+    // so this also covers Qt's application/x-qt-*-mime wrappers.
+    static const QStringList fileFormatMarkers {
+        QStringLiteral("public.file-url"),
+        QStringLiteral("NSFilenamesPboardType"),
+        QStringLiteral("promised-file"),
+        QStringLiteral("FileNameW"),
+        QStringLiteral("FileGroupDescriptor"),
+        QStringLiteral("FileContents"),
+        QStringLiteral("Shell IDList Array")
+    };
+
+    const QStringList formats = mime->formats();
+    for (const QString& format : formats) {
+        for (const QString& marker : fileFormatMarkers) {
+            if (format.contains(marker, Qt::CaseInsensitive)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+void ClipboardSync::setHostContext(const ClipboardSyncHostContext& hostContext)
+{
+    beginClipboardChange();
+    m_RetiredTokens.clear();
+    m_HaveClipboardSnapshot = false;
+    if (m_HostContext.address == hostContext.address &&
+        m_HostContext.httpsPort == hostContext.httpsPort &&
+        m_HostContext.serverCertificate == hostContext.serverCertificate &&
+        m_HostContext.clientCertificate == hostContext.clientCertificate &&
+        m_HostContext.clientPrivateKey == hostContext.clientPrivateKey) {
+        return;
+    }
+    // Pooled TLS connections must not survive a change of paired identity.
+    delete m_Nam;
+    m_Nam = nullptr;
+    m_HostContext = hostContext;
 }
 
 void ClipboardSync::start()
@@ -96,18 +170,29 @@ void ClipboardSync::start()
 
     QClipboard* cb = QGuiApplication::clipboard();
     if (cb == nullptr) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: no QClipboard available; sync disabled");
+        ClipboardLog::warn("ClipboardSync: no QClipboard available; sync disabled");
         return;
     }
 
+#ifdef Q_OS_MACOS
+    m_LastPasteboardChangeCount = ClipboardHelperPasteboardChangeCount();
+    connect(cb, &QClipboard::dataChanged,
+            this, &ClipboardSync::onMacClipboardDataChanged,
+            Qt::UniqueConnection);
+    if (m_PasteboardPollTimer == nullptr) {
+        m_PasteboardPollTimer = new QTimer(this);
+        connect(m_PasteboardPollTimer, &QTimer::timeout,
+                this, &ClipboardSync::pollPasteboardChangeCount);
+    }
+    m_PasteboardPollTimer->start(500);
+#else
     connect(cb, &QClipboard::dataChanged,
             this, &ClipboardSync::onLocalClipboardChanged,
             Qt::UniqueConnection);
+#endif
 
     m_Active = true;
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "ClipboardSync: started (text + PNG, bidirectional)");
+    ClipboardLog::info("ClipboardSync: started (text + PNG, bidirectional)");
 }
 
 void ClipboardSync::stop()
@@ -118,20 +203,32 @@ void ClipboardSync::stop()
 
     QClipboard* cb = QGuiApplication::clipboard();
     if (cb != nullptr) {
+#ifdef Q_OS_MACOS
+        disconnect(cb, &QClipboard::dataChanged,
+                   this, &ClipboardSync::onMacClipboardDataChanged);
+#else
         disconnect(cb, &QClipboard::dataChanged,
                    this, &ClipboardSync::onLocalClipboardChanged);
+#endif
     }
 
-    m_EchoCache.clear();
-    m_PendingSelfWrites = 0;
     m_Active = false;
+    beginClipboardChange();
+    m_RetiredTokens.clear();
+    m_HaveClipboardSnapshot = false;
+#ifdef Q_OS_MACOS
+    if (m_PasteboardPollTimer != nullptr) {
+        m_PasteboardPollTimer->stop();
+    }
+    m_LastPasteboardChangeCount = -1;
+#endif
 
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "ClipboardSync: stopped");
+    ClipboardLog::info("ClipboardSync: stopped");
 }
 
 void ClipboardSync::handleIncomingFrame(const char* data, int length)
 {
-    if (data == nullptr || length <= 0) {
+    if (data == nullptr || length < 10 || length > MAX_PAYLOAD + 10) {
         return;
     }
 
@@ -141,6 +238,42 @@ void ClipboardSync::handleIncomingFrame(const char* data, int length)
                               Q_ARG(QByteArray, frame));
 }
 
+#ifdef Q_OS_MACOS
+void ClipboardSync::onMacClipboardDataChanged()
+{
+    int changeCount = ClipboardHelperPasteboardChangeCount();
+    if (changeCount >= 0) {
+        m_LastPasteboardChangeCount = changeCount;
+    }
+
+    onLocalClipboardChanged();
+}
+
+void ClipboardSync::pollPasteboardChangeCount()
+{
+    if (!m_Active) {
+        return;
+    }
+
+    int changeCount = ClipboardHelperPasteboardChangeCount();
+    if (changeCount < 0) {
+        return;
+    }
+
+    if (m_LastPasteboardChangeCount < 0) {
+        m_LastPasteboardChangeCount = changeCount;
+        return;
+    }
+
+    if (changeCount == m_LastPasteboardChangeCount) {
+        return;
+    }
+
+    m_LastPasteboardChangeCount = changeCount;
+    onLocalClipboardChanged();
+}
+#endif
+
 void ClipboardSync::onIncomingFrame(QByteArray frame)
 {
     if (!m_Active) {
@@ -148,50 +281,107 @@ void ClipboardSync::onIncomingFrame(QByteArray frame)
     }
 
     uint8_t kind = 0;
+    quint32 token = 0;
     QByteArray payload;
-    if (!decodeFrame(frame, kind, payload)) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: discarding malformed inbound frame (%d bytes)",
+    if (!decodeFrame(frame, kind, token, payload)) {
+        ClipboardLog::warn("ClipboardSync: discarding malformed inbound frame (%d bytes)",
                     static_cast<int>(frame.size()));
         return;
     }
 
-    if (kind == KIND_TEXT) {
-        applyInboundText(payload);
+    if (kind != KIND_TEXT && kind != KIND_PNG && kind != KIND_REF) {
         return;
     }
-
-    if (kind == KIND_PNG) {
-        applyInboundPng(payload);
-        return;
-    }
-
+    QString id, mime;
+    qint64 size = 0;
     if (kind == KIND_REF) {
         // Payload is a small UTF-8 JSON descriptor: {"id":"...","mime":"...","size":N}.
         QJsonParseError jerr{};
         QJsonDocument doc = QJsonDocument::fromJson(payload, &jerr);
         if (jerr.error != QJsonParseError::NoError || !doc.isObject()) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: dropping inbound REF with bad JSON (%s)",
-                        jerr.errorString().toUtf8().constData());
+            ClipboardLog::warn("ClipboardSync: dropping inbound REF with bad JSON (%s)",
+                               jerr.errorString().toUtf8().constData());
             return;
         }
         QJsonObject obj = doc.object();
-        QString id = obj.value(QStringLiteral("id")).toString();
-        QString mime = obj.value(QStringLiteral("mime")).toString();
-        qint64 size = static_cast<qint64>(obj.value(QStringLiteral("size")).toDouble(0));
-        if (id.isEmpty() || id.size() > 128) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: dropping inbound REF with bad id length");
+        id = obj.value(QStringLiteral("id")).toString();
+        mime = obj.value(QStringLiteral("mime")).toString();
+        const double declaredSize = obj.value(QStringLiteral("size")).toDouble(-1);
+        if (!std::isfinite(declaredSize) || declaredSize < 0 || declaredSize > MAX_BLOB_BYTES ||
+            std::floor(declaredSize) != declaredSize) {
             return;
         }
-        if (size > MAX_BLOB_BYTES) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: dropping inbound REF, declared size %lld exceeds %lld cap",
-                        static_cast<long long>(size), static_cast<long long>(MAX_BLOB_BYTES));
+        size = static_cast<qint64>(declaredSize);
+        if (!QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,128}$")).match(id).hasMatch()) {
+            ClipboardLog::warn("ClipboardSync: dropping inbound REF with invalid blob id");
             return;
         }
-        fetchRefAndApply(id, mime, size);
+        if (mime != QStringLiteral("image/png") && !mime.startsWith(QStringLiteral("text/"))) {
+            return;
+        }
+    }
+    // A server may broadcast our own frames back while an image upload is
+    // still pending. Such echoes must not cancel that upload or split the
+    // local compound clipboard into a text-only value.
+    if (m_HaveClipboardSnapshot && token != 0 && token == m_OutgoingToken) {
+        if (kind == KIND_TEXT && hashBytes(payload) == m_LastTextHash) {
+            return;
+        }
+        QImage image;
+        if (kind == KIND_PNG && decodeImage(payload, image, "PNG") &&
+            hashImagePixels(image) == m_LastImageHash) {
+            return;
+        }
+    }
+    if (kind == KIND_REF && !m_LastOutboundRef.isEmpty() && payload == m_LastOutboundRef) {
+        return;
+    }
+    while (!m_RetiredTokens.isEmpty() &&
+           m_Clock.elapsed() - m_RetiredTokens.head().second > 30000) {
+        m_RetiredTokens.dequeue();
+    }
+    for (const auto& retired : m_RetiredTokens) {
+        if (token != 0 && token == retired.first) {
+            return;
+        }
+    }
+    if (token == 0 || token != m_CurrentToken) {
+        beginClipboardChange(token);
+    }
+
+    if (kind == KIND_TEXT) {
+        if (token == 0) {
+            applyInboundText(payload);
+        } else {
+            handleBurstFrame(kind, token, payload);
+        }
+        return;
+    }
+
+    if (kind == KIND_PNG) {
+        if (token == 0) {
+            applyInboundPng(payload);
+        } else {
+            handleBurstFrame(kind, token, payload);
+        }
+        return;
+    }
+
+    if (kind == KIND_REF) {
+        if (token == 0) {
+            fetchRefAndApply(id, mime, size);
+            return;
+        }
+
+        // Burst REF: start the fetch now; the bytes land in the aggregator
+        // (or apply standalone if the burst window already closed).
+        // Unsupported MIME types were rejected before starting this change.
+        const uint8_t flavorKind = (mime == QStringLiteral("image/png")) ? KIND_PNG : KIND_TEXT;
+        fetchBlob(id, size,
+                  [this, token, flavorKind](const QByteArray& bytes, const QString& fetchedMime) {
+                      Q_UNUSED(fetchedMime);
+                      burstFlavorResolved(token, flavorKind, bytes);
+                  });
         return;
     }
 
@@ -201,8 +391,7 @@ void ClipboardSync::onIncomingFrame(QByteArray frame)
 void ClipboardSync::applyInboundText(const QByteArray& payload)
 {
     if (payload.contains('\0')) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: dropping inbound text payload with embedded NUL");
+        ClipboardLog::warn("ClipboardSync: dropping inbound text payload with embedded NUL");
         return;
     }
 
@@ -211,20 +400,20 @@ void ClipboardSync::applyInboundText(const QByteArray& payload)
         return;
     }
 
-    // Record hash *before* writing so the dataChanged echo we're about to
-    // trigger is suppressed.
-    uint64_t hash = hashBytes(payload);
-    recordHash(hash);
-    ++m_PendingSelfWrites;
+    if (hasFileReferences(cb->mimeData())) {
+        ClipboardLog::debug("ClipboardSync: preserving local file clipboard; inbound text ignored");
+        return;
+    }
+
+    rememberClipboard(QString::fromUtf8(payload).toUtf8(), QImage());
     cb->setText(QString::fromUtf8(payload));
 }
 
 void ClipboardSync::applyInboundPng(const QByteArray& payload)
 {
     QImage image;
-    if (!image.loadFromData(payload, "PNG") || image.isNull()) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: dropping inbound PNG payload (decode failed, %d bytes)",
+    if (!decodeImage(payload, image, "PNG") || image.isNull()) {
+        ClipboardLog::warn("ClipboardSync: dropping inbound PNG payload (decode failed, %d bytes)",
                     static_cast<int>(payload.size()));
         return;
     }
@@ -234,11 +423,12 @@ void ClipboardSync::applyInboundPng(const QByteArray& payload)
         return;
     }
 
-    // Hash the wire bytes (not the decoded pixels) so the echo we suppress
-    // matches what we'd re-encode if QClipboard hands the image straight back.
-    uint64_t hash = hashBytes(payload);
-    recordHash(hash);
-    ++m_PendingSelfWrites;
+    if (hasFileReferences(cb->mimeData())) {
+        ClipboardLog::debug("ClipboardSync: preserving local file clipboard; inbound PNG ignored");
+        return;
+    }
+
+    rememberClipboard(QByteArray(), image);
 
     QMimeData* mime = new QMimeData();
     mime->setImageData(image);
@@ -258,8 +448,7 @@ bool ClipboardSync::encodeImageAsPng(const QImage& image,
 {
     const qint64 pixels = static_cast<qint64>(image.width()) * image.height();
     if (pixels <= 0 || pixels > MAX_IMAGE_PIXELS) {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: image too large from %s (%dx%d), dropping",
+        ClipboardLog::info("ClipboardSync: image too large from %s (%dx%d), dropping",
                     sourceDescription,
                     image.width(),
                     image.height());
@@ -271,8 +460,7 @@ bool ClipboardSync::encodeImageAsPng(const QImage& image,
     QBuffer buf(&outPng);
     buf.open(QIODevice::WriteOnly);
     if (!image.save(&buf, "PNG") || outPng.isEmpty()) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: PNG encode failed for %s (%dx%d)",
+        ClipboardLog::warn("ClipboardSync: PNG encode failed for %s (%dx%d)",
                     sourceDescription,
                     image.width(),
                     image.height());
@@ -284,50 +472,68 @@ bool ClipboardSync::encodeImageAsPng(const QImage& image,
 }
 
 void ClipboardSync::sendClipboardPng(const QByteArray& png,
-                                     const QString& sourceDescription)
+                                     const QString& sourceDescription,
+                                     quint32 token)
 {
     const QByteArray sourceUtf8 = sourceDescription.isEmpty()
             ? QByteArrayLiteral("unknown source")
             : sourceDescription.toUtf8();
 
-    if (png.size() > MAX_PAYLOAD) {
-        // Out-of-band path. Record the underlying PNG hash before
-        // upload so the echo we'll see when the host loops the REF
-        // back (and we fetch the same bytes) is suppressed.
-        if (png.size() > MAX_BLOB_BYTES) {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: PNG payload %lld B from %s exceeds %lld B blob cap, dropping",
-                        static_cast<long long>(png.size()),
-                        sourceUtf8.constData(),
-                        static_cast<long long>(MAX_BLOB_BYTES));
-            return;
-        }
-        uint64_t hash = hashBytes(png);
-        if (seenRecently(hash)) {
-            return;
-        }
-        recordHash(hash);
-        uploadAndSendRef(png, QStringLiteral("image/png"));
+    if (png.size() > MAX_BLOB_BYTES) {
+        ClipboardLog::info("ClipboardSync: PNG payload %lld B from %s exceeds %lld B blob cap, dropping",
+                    static_cast<long long>(png.size()),
+                    sourceUtf8.constData(),
+                    static_cast<long long>(MAX_BLOB_BYTES));
         return;
     }
 
-    uint64_t hash = hashBytes(png);
-    if (seenRecently(hash)) {
+    if (shouldTransferOutOfBand(png.size())) {
+        uploadAndSendRef(png, QStringLiteral("image/png"), token);
         return;
     }
-    recordHash(hash);
 
     QByteArray frame;
-    if (encodeFrame(KIND_PNG, png, frame)) {
-        int rc = LiSendClipboardData(frame.constData(), frame.size());
-        if (rc != 0) {
-            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
-                         "ClipboardSync: LiSendClipboardData(PNG, %d bytes from %s) -> %d",
-                         static_cast<int>(frame.size()),
-                         sourceUtf8.constData(),
-                         rc);
-        }
+    if (encodeFrame(KIND_PNG, token, png, frame)) {
+        ClipboardLog::debug("ClipboardSync: outbound PNG frame queued (%d bytes from %s, token %u)",
+                     static_cast<int>(frame.size()),
+                     sourceUtf8.constData(),
+                     token);
+        emit outboundFrame(frame);
     }
+}
+
+void ClipboardSync::sendTextOutbound(const QByteArray& utf8, quint32 token)
+{
+    if (utf8.isEmpty()) {
+        return;
+    }
+
+    if (utf8.size() > MAX_BLOB_BYTES) {
+        ClipboardLog::info("ClipboardSync: text payload %lld B exceeds %lld B blob cap, dropping",
+                    static_cast<long long>(utf8.size()),
+                    static_cast<long long>(MAX_BLOB_BYTES));
+        return;
+    }
+
+    if (token == 0 && shouldTransferOutOfBand(utf8.size())) {
+        ClipboardLog::debug("ClipboardSync: uploading outbound text blob (%lld bytes)",
+                     static_cast<long long>(utf8.size()));
+        // Sunshine's blob endpoint intentionally accepts only a bare
+        // RFC 6838 type/subtype without parameters. KIND_TEXT already
+        // defines the blob bytes as UTF-8.
+        uploadAndSendRef(utf8, QStringLiteral("text/plain"), token);
+        return;
+    }
+
+    QByteArray frame;
+    if (!encodeFrame(KIND_TEXT, token, utf8, frame)) {
+        return;
+    }
+
+    ClipboardLog::debug("ClipboardSync: outbound text frame queued (%d bytes, token %u)",
+                 static_cast<int>(frame.size()),
+                 token);
+    emit outboundFrame(frame);
 }
 
 bool ClipboardSync::tryExtractImageBytes(const QMimeData* mime,
@@ -354,7 +560,7 @@ bool ClipboardSync::tryExtractImageBytes(const QMimeData* mime,
         }
 
         QImage image;
-        if (!image.loadFromData(bytes)) {
+        if (!decodeImage(bytes, image)) {
             continue;
         }
 
@@ -364,8 +570,7 @@ bool ClipboardSync::tryExtractImageBytes(const QMimeData* mime,
                 && looksLikePngBytes(bytes)) {
             const qint64 pixels = static_cast<qint64>(image.width()) * image.height();
             if (pixels <= 0 || pixels > MAX_IMAGE_PIXELS) {
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "ClipboardSync: image too large from mime %s (%dx%d), dropping",
+                ClipboardLog::info("ClipboardSync: image too large from mime %s (%dx%d), dropping",
                             format.toUtf8().constData(),
                             image.width(),
                             image.height());
@@ -379,38 +584,6 @@ bool ClipboardSync::tryExtractImageBytes(const QMimeData* mime,
 
         if (outSourceDescription != nullptr) {
             *outSourceDescription = format;
-        }
-        return true;
-    }
-
-    return false;
-}
-
-bool ClipboardSync::tryExtractImageFromUrls(const QMimeData* mime,
-                                            QByteArray& outPng,
-                                            QString* outSourceDescription) const
-{
-    if (mime == nullptr || !mime->hasUrls()) {
-        return false;
-    }
-
-    const QList<QUrl> urls = mime->urls();
-    for (const QUrl& url : urls) {
-        if (!url.isLocalFile()) {
-            continue;
-        }
-
-        QImage image(url.toLocalFile());
-        if (image.isNull()) {
-            continue;
-        }
-
-        if (!encodeImageAsPng(image, outPng, "local file url")) {
-            continue;
-        }
-
-        if (outSourceDescription != nullptr) {
-            *outSourceDescription = QStringLiteral("url:%1").arg(url.toLocalFile());
         }
         return true;
     }
@@ -454,22 +627,20 @@ bool ClipboardSync::tryExtractImageFromHtml(const QMimeData* mime,
             }
 
             QImage image;
-            if (!image.loadFromData(bytes)) {
+            if (!decodeImage(bytes, image)) {
                 continue;
             }
 
-            if (dataUrlMatch.captured(1).compare(QStringLiteral("image/png"), Qt::CaseInsensitive) == 0) {
+            if (looksLikePngBytes(bytes)) {
                 const qint64 pixels = static_cast<qint64>(image.width()) * image.height();
                 if (pixels <= 0 || pixels > MAX_IMAGE_PIXELS) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "ClipboardSync: image too large from html data URL (%dx%d), dropping",
+                    ClipboardLog::info("ClipboardSync: image too large from html data URL (%dx%d), dropping",
                                 image.width(),
                                 image.height());
                     return false;
                 }
                 outPng = bytes;
-            }
-            else if (!encodeImageAsPng(image, outPng, "html data url")) {
+            } else if (!encodeImageAsPng(image, outPng, "html data url")) {
                 continue;
             }
 
@@ -479,24 +650,7 @@ bool ClipboardSync::tryExtractImageFromHtml(const QMimeData* mime,
             return true;
         }
 
-        const QUrl url(src);
-        if (!url.isLocalFile()) {
-            continue;
-        }
-
-        QImage image(url.toLocalFile());
-        if (image.isNull()) {
-            continue;
-        }
-
-        if (!encodeImageAsPng(image, outPng, "html local file")) {
-            continue;
-        }
-
-        if (outSourceDescription != nullptr) {
-            *outSourceDescription = QStringLiteral("html:%1").arg(url.toLocalFile());
-        }
-        return true;
+        // Never open local files referenced by markup from another application.
     }
 
     return false;
@@ -546,10 +700,6 @@ bool ClipboardSync::extractClipboardPng(const QMimeData* mime,
         }
     }
 
-    if (tryExtractImageFromUrls(mime, outPng, outSourceDescription)) {
-        return true;
-    }
-
     if (tryExtractImageFromHtml(mime, outPng, outSourceDescription)) {
         return true;
     }
@@ -563,11 +713,6 @@ void ClipboardSync::onLocalClipboardChanged()
         return;
     }
 
-    if (m_PendingSelfWrites > 0) {
-        --m_PendingSelfWrites;
-        return;
-    }
-
     QClipboard* cb = QGuiApplication::clipboard();
     if (cb == nullptr) {
         return;
@@ -575,14 +720,91 @@ void ClipboardSync::onLocalClipboardChanged()
 
     const QMimeData* mime = cb->mimeData();
 
+    // File copies must not leak their contents as clipboard messages:
+    // Finder/Explorer copies would send the file name as text and their
+    // icon bitmap as an image. But document- and chat-app image copies
+    // (Preview, WeChat/QQ message copies) also attach local file
+    // references alongside the real bitmap — those must still sync, or
+    // the most common macOS image-copy flows silently do nothing.
+    // Distinguish by origin: Finder stamps its file clipboards with
+    // noderef/fndf markers; anything else carrying a transferable image
+    // is treated as an image copy. File references without a usable
+    // image stay skipped (the inbound guards below still protect a
+    // pending local file paste from being clobbered by remote content).
+    bool finderOrigin = false;
+#ifdef Q_OS_MACOS
+    // Finder stamps its file copies with node-reference flavors that Qt
+    // never surfaces in QMimeData::formats(); ask the raw pasteboard.
+    finderOrigin = ClipboardHelperIsFinderPasteboard();
+#endif
+    if (mime != nullptr) {
+        for (const QString& format : mime->formats()) {
+            if (format.contains(QStringLiteral("Shell IDList Array"), Qt::CaseInsensitive) ||
+                format.contains(QStringLiteral("FileGroupDescriptor"), Qt::CaseInsensitive)) {
+                finderOrigin = true;
+            }
+        }
+    }
+    if (finderOrigin) {
+        beginClipboardChange();
+        m_HaveClipboardSnapshot = false;
+        ClipboardLog::debug("ClipboardSync: Finder file clipboard detected; sync skipped");
+        return;
+    }
+
     // Image takes precedence — some applications attach a fallback text label
     // (file path, alt text) alongside the bitmap; we want the picture, not the
     // path. To match HarmonyOS' record iteration behavior more closely, try
     // multiple extraction paths rather than only mime->imageData().
     QByteArray png;
     QString imageSourceDescription;
-    if (extractClipboardPng(mime, png, &imageSourceDescription)) {
-        sendClipboardPng(png, imageSourceDescription);
+    const bool havePng = extractClipboardPng(mime, png, &imageSourceDescription);
+    if (hasFileReferences(mime) && !havePng) {
+        beginClipboardChange();
+        m_HaveClipboardSnapshot = false;
+        ClipboardLog::debug(
+            "ClipboardSync: file clipboard without transferable image; sync skipped");
+        return;
+    }
+
+    // A clipboard change can genuinely carry both flavors (browser image
+    // copies attach the source URL, IM clients alt text). Emit both as a
+    // compound burst so aggregating peers restore the full clipboard; peers
+    // without aggregation apply the frames in order and keep the v1 outcome.
+    // Note the burst text frame is inline-only: a REF text frame would race
+    // the image frame onto the wire (blob upload latency) and flip legacy
+    // peers' final state to text, so oversize text is dropped from bursts.
+    QString text = hasFileReferences(mime) ? QString() : cb->text();
+    QByteArray utf8;
+    if (!text.isEmpty()) {
+        utf8 = text.toUtf8();
+    }
+
+    QImage image;
+    if (havePng && !decodeImage(png, image, "PNG")) {
+        return;
+    }
+    const uint64_t textHash = hashBytes(utf8);
+    const uint64_t imageHash = hashImagePixels(image);
+    if (m_HaveClipboardSnapshot && textHash == m_LastTextHash && imageHash == m_LastImageHash) {
+        return;
+    }
+    beginClipboardChange();
+    rememberClipboard(utf8, image);
+
+    if (havePng) {
+        if (!utf8.isEmpty() && utf8.size() <= MAX_INLINE_PAYLOAD) {
+            const quint32 token = nextToken();
+            m_OutgoingToken = token;
+            sendTextOutbound(utf8, token);
+            sendClipboardPng(png, imageSourceDescription, token);
+        } else {
+            if (!utf8.isEmpty()) {
+                ClipboardLog::info("ClipboardSync: burst text %lld B exceeds inline cap; sending image only",
+                            static_cast<long long>(utf8.size()));
+            }
+            sendClipboardPng(png, imageSourceDescription);
+        }
         return;
     }
 
@@ -599,47 +821,17 @@ void ClipboardSync::onLocalClipboardChanged()
 
         if (hasImageLikeHints) {
             const QString formatsSummary = mime->formats().join(QStringLiteral(", "));
-            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
-                         "ClipboardSync: no transferable image found in clipboard formats [%s]",
+            ClipboardLog::debug("ClipboardSync: no transferable image found in clipboard formats [%s]",
                          formatsSummary.toUtf8().constData());
         }
     }
 
-    QString text = cb->text();
-    if (text.isEmpty()) {
-        return;
-    }
-
-    QByteArray utf8 = text.toUtf8();
-    if (utf8.isEmpty() || utf8.size() > MAX_PAYLOAD) {
-        return;
-    }
-
-    uint64_t hash = hashBytes(utf8);
-    if (seenRecently(hash)) {
-        // This change was the echo of a payload the host just pushed to us.
-        return;
-    }
-    recordHash(hash);
-
-    QByteArray frame;
-    if (!encodeFrame(KIND_TEXT, utf8, frame)) {
-        return;
-    }
-
-    int rc = LiSendClipboardData(frame.constData(), frame.size());
-    if (rc != 0) {
-        // Negative return = no active session, host doesn't support clipboard,
-        // or send failed; log once at debug level to avoid spam.
-        SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
-                     "ClipboardSync: LiSendClipboardData(text, %d bytes) -> %d",
-                     static_cast<int>(frame.size()), rc);
-    }
+    sendTextOutbound(utf8, 0);
 }
 
-bool ClipboardSync::encodeFrame(uint8_t kind, const QByteArray& payload, QByteArray& outFrame) const
+bool ClipboardSync::encodeFrame(uint8_t kind, quint32 token, const QByteArray& payload, QByteArray& outFrame) const
 {
-    if (payload.size() > MAX_PAYLOAD) {
+    if (payload.size() > MAX_INLINE_PAYLOAD) {
         return false;
     }
 
@@ -650,8 +842,9 @@ bool ClipboardSync::encodeFrame(uint8_t kind, const QByteArray& payload, QByteAr
     outFrame.append(static_cast<char>(WIRE_VERSION));
     // u8 kind
     outFrame.append(static_cast<char>(kind));
-    // u32 token (LE) - we don't generate tokens client-side; 0 is accepted.
-    quint32 tokenLE = qToLittleEndian<quint32>(0);
+    // u32 token (LE) - 0 for standalone frames; frames of one compound burst
+    // share a non-zero token (see class comment).
+    quint32 tokenLE = qToLittleEndian<quint32>(token);
     outFrame.append(reinterpret_cast<const char*>(&tokenLE), sizeof(tokenLE));
     // u32 length (LE)
     quint32 lenLE = qToLittleEndian<quint32>(static_cast<quint32>(payload.size()));
@@ -663,6 +856,7 @@ bool ClipboardSync::encodeFrame(uint8_t kind, const QByteArray& payload, QByteAr
 
 bool ClipboardSync::decodeFrame(const QByteArray& frame,
                                 uint8_t& outKind,
+                                quint32& outToken,
                                 QByteArray& outPayload) const
 {
     // 1 + 1 + 4 + 4 = 10 byte header minimum.
@@ -678,43 +872,21 @@ bool ClipboardSync::decodeFrame(const QByteArray& frame,
 
     outKind = p[1];
 
+    quint32 tokenLE = 0;
+    memcpy(&tokenLE, p + 2, sizeof(tokenLE));
+    outToken = qFromLittleEndian<quint32>(tokenLE);
+
     quint32 lenLE = 0;
     memcpy(&lenLE, p + 6, sizeof(lenLE));
     quint32 length = qFromLittleEndian<quint32>(lenLE);
 
-    if (length > static_cast<quint32>(frame.size() - 10)) {
+    if (length > MAX_PAYLOAD || length != static_cast<quint32>(frame.size() - 10)) {
         return false;
     }
 
     outPayload = QByteArray(reinterpret_cast<const char*>(p + 10),
                             static_cast<int>(length));
     return true;
-}
-
-bool ClipboardSync::seenRecently(uint64_t hash)
-{
-    qint64 now = QDateTime::currentMSecsSinceEpoch();
-
-    // Drop stale entries off the front first.
-    while (!m_EchoCache.isEmpty() && (now - m_EchoCache.front().second) > ECHO_TTL_MS) {
-        m_EchoCache.removeFirst();
-    }
-
-    for (const auto& e : m_EchoCache) {
-        if (e.first == hash) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void ClipboardSync::recordHash(uint64_t hash)
-{
-    qint64 now = QDateTime::currentMSecsSinceEpoch();
-    m_EchoCache.enqueue(qMakePair(hash, now));
-    while (m_EchoCache.size() > ECHO_MAX) {
-        m_EchoCache.removeFirst();
-    }
 }
 
 uint64_t ClipboardSync::hashBytes(const QByteArray& bytes)
@@ -728,19 +900,113 @@ uint64_t ClipboardSync::hashBytes(const QByteArray& bytes)
     return h;
 }
 
+uint64_t ClipboardSync::hashImagePixels(const QImage& image)
+{
+    if (image.isNull()) {
+        return 0;
+    }
+
+    // Normalize to one straight-alpha format so identical pixel content
+    // hashes identically no matter which flavor (PNG/TIFF/DIB) or Qt format
+    // it came back as. Opaque images (the overwhelmingly common clipboard
+    // case) survive every lossless conversion bit-exact; semi-transparent
+    // pixels may drift by rounding through a premultiplied intermediate,
+    // which at worst degrades back to byte-hash-only suppression.
+    const QImage canonical = image.convertToFormat(QImage::Format_RGBA8888);
+    if (canonical.isNull() || canonical.width() <= 0 || canonical.height() <= 0) {
+        return 0;
+    }
+
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const auto mixBytes = [&h](const uchar* bytes, int count) {
+        for (int i = 0; i < count; ++i) {
+            h ^= bytes[i];
+            h *= 0x100000001b3ULL;
+        }
+    };
+
+    // Fold dimensions in so equal bytes under different geometry don't collide.
+    const quint32 dimensions[2] = {
+        static_cast<quint32>(canonical.width()),
+        static_cast<quint32>(canonical.height()),
+    };
+    mixBytes(reinterpret_cast<const uchar*>(dimensions), sizeof(dimensions));
+
+    // Scan row data only, skipping any per-row stride padding.
+    const int rowBytes = canonical.width() * 4;
+    for (int y = 0; y < canonical.height(); ++y) {
+        mixBytes(canonical.constScanLine(y), rowBytes);
+    }
+
+    return h;
+}
+
+bool ClipboardSync::decodeImage(const QByteArray& bytes, QImage& image, const char* format)
+{
+    if (bytes.isEmpty() || bytes.size() > MAX_BLOB_BYTES) {
+        return false;
+    }
+    QBuffer buffer;
+    buffer.setData(bytes);
+    buffer.open(QIODevice::ReadOnly);
+    QImageReader reader(&buffer, format ? QByteArray(format) : QByteArray());
+    const QSize size = reader.size();
+    if (size.width() <= 0 || size.height() <= 0 ||
+        qint64(size.width()) * size.height() > MAX_IMAGE_PIXELS) {
+        return false;
+    }
+    image = reader.read();
+    return !image.isNull() && qint64(image.width()) * image.height() <= MAX_IMAGE_PIXELS;
+}
+
+void ClipboardSync::rememberClipboard(const QByteArray& text, const QImage& image)
+{
+    m_HaveClipboardSnapshot = true;
+    m_LastTextHash = hashBytes(text);
+    m_LastImageHash = hashImagePixels(image);
+}
+
+void ClipboardSync::beginClipboardChange(quint32 token)
+{
+    ++m_Revision;
+    if (m_CurrentToken != 0) {
+        m_RetiredTokens.enqueue(qMakePair(m_CurrentToken, m_Clock.elapsed()));
+        while (m_RetiredTokens.size() > MAX_PENDING_BURSTS) {
+            m_RetiredTokens.dequeue();
+        }
+    }
+    m_CurrentToken = token;
+    m_OutgoingToken = 0;
+    m_LastOutboundRef.clear();
+    const auto replies = m_BlobReplies.values();
+    for (QNetworkReply* reply : replies) {
+        reply->abort();
+    }
+    const auto tokens = m_PendingBursts.keys();
+    for (quint32 oldToken : tokens) {
+        removeBurst(oldToken);
+    }
+}
+
 QNetworkAccessManager* ClipboardSync::nam()
 {
     if (m_Nam == nullptr) {
         m_Nam = new QNetworkAccessManager(this);
-        // Pin the host's self-signed cert exactly like NvHTTP does: ignore
-        // SSL errors only when the offending cert matches the pinned one.
+        // Validate every new TLS connection before HTTP data is sent. Reused
+        // connections belong to this manager's immutable paired identity.
+        const QSslCertificate pinned = m_HostContext.serverCertificate;
+        connect(m_Nam, &QNetworkAccessManager::encrypted, this, [pinned](QNetworkReply* reply) {
+            if (pinned.isNull() || reply->sslConfiguration().peerCertificate() != pinned) {
+                reply->abort();
+            }
+        });
         connect(m_Nam, &QNetworkAccessManager::sslErrors, this,
                 [this](QNetworkReply* reply, const QList<QSslError>& errors) {
-                    if (m_Computer == nullptr || m_Computer->serverCert.isNull()) {
+                    if (m_HostContext.serverCertificate.isNull()) {
                         return;
                     }
                     for (const QSslError& e : errors) {
-                        if (m_Computer->serverCert != e.certificate()) {
+                        if (m_HostContext.serverCertificate != e.certificate()) {
                             return;
                         }
                     }
@@ -752,134 +1018,298 @@ QNetworkAccessManager* ClipboardSync::nam()
 
 bool ClipboardSync::buildBlobUrl(const QString& tail, QUrl& outUrl) const
 {
-    if (m_Computer == nullptr || m_Computer->serverCert.isNull()) {
+    if (m_HostContext.address.isEmpty() ||
+            m_HostContext.httpsPort == 0 ||
+            m_HostContext.serverCertificate.isNull()) {
         return false;
     }
-    NvAddress addr = m_Computer->activeAddress;
-    uint16_t port = m_Computer->activeHttpsPort;
-    if (addr.isNull() || port == 0) {
-        return false;
-    }
-    QString host = addr.address();
-    if (host.contains(':')) {
-        host = QString("[%1]").arg(host); // bracketed IPv6
-    }
-    outUrl = QUrl(QString("https://%1:%2/api/v1/clipboard%3").arg(host).arg(port).arg(tail));
+    outUrl = QUrl();
+    outUrl.setScheme(QStringLiteral("https"));
+    outUrl.setHost(m_HostContext.address);
+    outUrl.setPort(m_HostContext.httpsPort);
+    outUrl.setPath(QStringLiteral("/api/v1/clipboard") + tail);
     return outUrl.isValid();
 }
 
-void ClipboardSync::uploadAndSendRef(const QByteArray& payload, const QString& mime)
+void ClipboardSync::readBlobReply(
+    QNetworkReply* reply, qint64 limit,
+    const std::function<void(const QByteArray&, const QString&)>& onFetched)
 {
-    QUrl url;
-    if (!buildBlobUrl(QStringLiteral("/blob"), url)) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: cannot upload blob (no host context)");
-        return;
-    }
-
-    QNetworkRequest req(url);
-    req.setHeader(QNetworkRequest::ContentTypeHeader,
-                  QStringLiteral("application/octet-stream"));
-    req.setRawHeader("X-Clipboard-Mime", mime.toUtf8());
-    // Sunshine pins clipboard blob endpoint to its mTLS server (cert
-    // required); reuse the same paired client identity nvhttp does, or
-    // every fetch/upload fails with a TLS 'certificate required' alert.
-    req.setSslConfiguration(IdentityManager::get()->getSslConfig());
-
-    QNetworkReply* reply = nam()->post(req, payload);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, mime, payloadSize = payload.size()]() {
-        reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: blob upload failed: %s",
-                        reply->errorString().toUtf8().constData());
+    m_BlobReplies.insert(reply);
+    const quint64 revision = m_Revision;
+    const QSslCertificate pinned = m_HostContext.serverCertificate;
+    const auto bytes = std::make_shared<QByteArray>();
+    reply->setReadBufferSize(64 * 1024);
+    auto* timeout = new QTimer(reply);
+    timeout->setSingleShot(true);
+    connect(timeout, &QTimer::timeout, reply, &QNetworkReply::abort);
+    timeout->start(30000);
+    const auto drain = [reply, bytes, limit]() {
+        if (!reply->isOpen() || reply->error() != QNetworkReply::NoError) {
             return;
         }
-        QJsonParseError jerr{};
-        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll(), &jerr);
-        if (jerr.error != QJsonParseError::NoError || !doc.isObject()) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: blob upload response not JSON: %s",
-                        jerr.errorString().toUtf8().constData());
-            return;
+        bytes->append(reply->read(limit - bytes->size() + 1));
+        if (bytes->size() > limit) {
+            reply->abort();
         }
-        QString id = doc.object().value(QStringLiteral("id")).toString();
-        if (id.isEmpty()) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: blob upload response missing id");
-            return;
-        }
-
-        QJsonObject meta;
-        meta.insert(QStringLiteral("id"), id);
-        meta.insert(QStringLiteral("mime"), mime);
-        meta.insert(QStringLiteral("size"), static_cast<double>(payloadSize));
-        QByteArray json = QJsonDocument(meta).toJson(QJsonDocument::Compact);
-
-        QByteArray frame;
-        if (!encodeFrame(KIND_REF, json, frame)) {
-            return;
-        }
-        int rc = LiSendClipboardData(frame.constData(), frame.size());
-        if (rc != 0) {
-            SDL_LogDebug(SDL_LOG_CATEGORY_APPLICATION,
-                         "ClipboardSync: LiSendClipboardData(REF, %d bytes) -> %d",
-                         static_cast<int>(frame.size()), rc);
+    };
+    connect(reply, &QNetworkReply::readyRead, this, drain);
+    connect(reply, &QNetworkReply::metaDataChanged, this, [reply, limit]() {
+        if (reply->header(QNetworkRequest::ContentLengthHeader).toLongLong() > limit) {
+            reply->abort();
         }
     });
+    connect(
+        reply, &QNetworkReply::finished, this,
+        [this, reply, bytes, revision, pinned, timeout, onFetched, limit]() {
+            timeout->stop();
+            m_BlobReplies.remove(reply);
+            reply->deleteLater();
+            if (!m_Active || revision != m_Revision) {
+                return;
+            }
+            // Read the last bytes even when the backend omitted a final readyRead.
+            // Do not re-enter finished via abort() while draining the completed reply.
+            if (reply->error() == QNetworkReply::NoError && reply->isOpen()) {
+                bytes->append(reply->read(limit - bytes->size() + 1));
+            }
+            const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (reply->error() != QNetworkReply::NoError || bytes->size() > limit ||
+                pinned.isNull() || reply->sslConfiguration().peerCertificate() != pinned ||
+                status < 200 || status >= 300) {
+                ClipboardLog::warn("ClipboardSync: blob transfer failed or exceeded its limits");
+                // Let an explicit repeat copy retry a failed upload.
+                if (reply->operation() == QNetworkAccessManager::PostOperation) {
+                    m_HaveClipboardSnapshot = false;
+                }
+                return;
+            }
+            onFetched(*bytes, reply->header(QNetworkRequest::ContentTypeHeader).toString());
+        });
+}
+
+void ClipboardSync::uploadAndSendRef(const QByteArray& payload, const QString& mime, quint32 token)
+{
+    QUrl url;
+    if (!m_Active || payload.size() > MAX_BLOB_BYTES || m_BlobReplies.size() >= 4 ||
+        !buildBlobUrl(QStringLiteral("/blob"), url)) {
+        m_HaveClipboardSnapshot = false;
+        return;
+    }
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                     QNetworkRequest::ManualRedirectPolicy);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/octet-stream"));
+    req.setRawHeader("X-Clipboard-Mime", mime.toUtf8());
+    QSslConfiguration sslConfig(QSslConfiguration::defaultConfiguration());
+    sslConfig.setLocalCertificate(m_HostContext.clientCertificate);
+    sslConfig.setPrivateKey(m_HostContext.clientPrivateKey);
+    req.setSslConfiguration(sslConfig);
+
+    readBlobReply(nam()->post(req, payload), 16 * 1024,
+                  [this, mime, token, payloadSize = payload.size()](const QByteArray& response,
+                                                                    const QString&) {
+                      const QJsonDocument doc = QJsonDocument::fromJson(response);
+                      const QString id = doc.object().value(QStringLiteral("id")).toString();
+                      if (!QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,128}$"))
+                               .match(id)
+                               .hasMatch()) {
+                          m_HaveClipboardSnapshot = false;
+                          return;
+                      }
+                      QJsonObject meta;
+                      meta.insert(QStringLiteral("id"), id);
+                      meta.insert(QStringLiteral("mime"), mime);
+                      meta.insert(QStringLiteral("size"), static_cast<double>(payloadSize));
+                      QByteArray frame;
+                      m_LastOutboundRef = QJsonDocument(meta).toJson(QJsonDocument::Compact);
+                      if (encodeFrame(KIND_REF, token, m_LastOutboundRef, frame)) {
+                          emit outboundFrame(frame);
+                      }
+                  });
 }
 
 void ClipboardSync::fetchRefAndApply(const QString& id, const QString& mime, qint64 advertisedSize)
 {
-    QUrl url;
-    if (!buildBlobUrl(QStringLiteral("/blob/") + id, url)) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "ClipboardSync: cannot fetch blob (no host context)");
-        return;
-    }
-
-    QNetworkRequest req(url);
-    req.setSslConfiguration(IdentityManager::get()->getSslConfig());
-
-    QNetworkReply* reply = nam()->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, mime, advertisedSize]() {
-        reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: blob fetch failed: %s",
-                        reply->errorString().toUtf8().constData());
-            return;
-        }
-        QByteArray bytes = reply->readAll();
-        if (bytes.isEmpty()) {
-            return;
-        }
-        // Defense: cap actual download size in case the server lied about
-        // advertised size or QNAM streamed past the declared length.
-        if (bytes.size() > MAX_BLOB_BYTES) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: dropping fetched blob, actual size %lld exceeds %lld cap",
-                        static_cast<long long>(bytes.size()),
-                        static_cast<long long>(MAX_BLOB_BYTES));
-            return;
-        }
-        // Hard-fail on advertised/actual mismatch when REF declared a size.
-        if (advertisedSize > 0 && bytes.size() != advertisedSize) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: dropping fetched blob, size mismatch (got %lld, advertised %lld)",
-                        static_cast<long long>(bytes.size()),
-                        static_cast<long long>(advertisedSize));
-            return;
-        }
+    fetchBlob(id, advertisedSize, [this, mime](const QByteArray& bytes, const QString& fetchedMime) {
+        Q_UNUSED(fetchedMime);
         // Trust the REF descriptor's mime over Content-Type.
         if (mime == QStringLiteral("image/png")) {
             applyInboundPng(bytes);
         } else if (mime.startsWith(QStringLiteral("text/"))) {
             applyInboundText(bytes);
         } else {
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "ClipboardSync: dropping fetched blob with unsupported mime '%s'",
+            ClipboardLog::info("ClipboardSync: dropping fetched blob with unsupported mime '%s'",
                         mime.toUtf8().constData());
         }
     });
+}
+
+void ClipboardSync::fetchBlob(const QString& id,
+                              qint64 advertisedSize,
+                              const std::function<void(const QByteArray&, const QString&)>& onFetched)
+{
+    QUrl url;
+    if (!m_Active || m_BlobReplies.size() >= 4 ||
+        !QRegularExpression(QStringLiteral("^[A-Za-z0-9_-]{1,128}$")).match(id).hasMatch() ||
+        !buildBlobUrl(QStringLiteral("/blob/") + id, url)) {
+        return;
+    }
+    QNetworkRequest req(url);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                     QNetworkRequest::ManualRedirectPolicy);
+    QSslConfiguration sslConfig(QSslConfiguration::defaultConfiguration());
+    sslConfig.setLocalCertificate(m_HostContext.clientCertificate);
+    sslConfig.setPrivateKey(m_HostContext.clientPrivateKey);
+    req.setSslConfiguration(sslConfig);
+    readBlobReply(nam()->get(req), advertisedSize > 0 ? advertisedSize : MAX_BLOB_BYTES,
+                  [advertisedSize, onFetched](const QByteArray& bytes, const QString& mime) {
+                      if (advertisedSize > 0 && bytes.size() != advertisedSize) {
+                          ClipboardLog::warn("ClipboardSync: blob size mismatch");
+                          return;
+                      }
+                      onFetched(bytes, mime);
+                  });
+}
+
+quint32 ClipboardSync::nextToken()
+{
+    quint32 token = m_NextToken++;
+    if (m_NextToken == 0) {
+        m_NextToken = 1;
+    }
+    return token;
+}
+
+void ClipboardSync::handleBurstFrame(uint8_t kind, quint32 token, const QByteArray& payload)
+{
+    if (!m_PendingBursts.contains(token)) {
+        if (m_PendingBursts.size() >= MAX_PENDING_BURSTS) {
+            // Defensive bound: a pathological sender must not grow the map
+            // without limit; drop the oldest (already-applied) burst.
+            ClipboardLog::warn("ClipboardSync: burst backlog exceeded; dropping oldest burst");
+            removeBurst(m_PendingBursts.constBegin().key());
+        }
+
+        BurstState state;
+        state.timer = new QTimer(this);
+        state.timer->setSingleShot(true);
+        connect(state.timer, &QTimer::timeout, this, [this, token]() {
+            if (token == m_CurrentToken && !m_BlobReplies.isEmpty()) {
+                m_PendingBursts[token].timer->start(BURST_RETENTION_MS);
+                return;
+            }
+            removeBurst(token);
+        });
+        state.timer->start(BURST_RETENTION_MS);
+        m_PendingBursts.insert(token, state);
+    }
+
+    BurstState& state = m_PendingBursts[token];
+    if (kind == KIND_TEXT && !state.haveText) {
+        state.haveText = true;
+        state.textPayload = payload;
+    } else if (kind == KIND_PNG && !state.havePng) {
+        state.havePng = true;
+        state.pngPayload = payload;
+    } else {
+        // Duplicate kind for this token; keep the first copy.
+        return;
+    }
+
+    if (state.haveText && state.havePng) {
+        applyCompound(state.textPayload, state.pngPayload);
+    } else if (kind == KIND_TEXT) {
+        applyInboundText(state.textPayload);
+    } else {
+        applyInboundPng(state.pngPayload);
+    }
+}
+
+void ClipboardSync::burstFlavorResolved(quint32 token, uint8_t kind, const QByteArray& payload)
+{
+    if (kind == 0) {
+        // Unsupported REF mime: nothing to contribute.
+        return;
+    }
+
+    if (token != m_CurrentToken) {
+        return;
+    }
+
+    handleBurstFrame(kind, token, payload);
+}
+
+void ClipboardSync::removeBurst(quint32 token)
+{
+    const auto it = m_PendingBursts.find(token);
+    if (it == m_PendingBursts.end()) {
+        return;
+    }
+
+    QTimer* timer = it.value().timer;
+    m_PendingBursts.erase(it);
+    if (timer != nullptr) {
+        timer->stop();
+        timer->deleteLater();
+    }
+}
+
+void ClipboardSync::applyCompound(const QByteArray& text, const QByteArray& png)
+{
+    QClipboard* cb = QGuiApplication::clipboard();
+    if (cb == nullptr) {
+        return;
+    }
+
+    if (hasFileReferences(cb->mimeData())) {
+        ClipboardLog::debug("ClipboardSync: preserving local file clipboard; inbound compound ignored");
+        return;
+    }
+
+    const bool textOk = !text.isEmpty() && !text.contains('\0');
+    QImage image;
+    if (!decodeImage(png, image, "PNG") || image.isNull()) {
+        image = QImage();
+    }
+
+    if (textOk && !image.isNull()) {
+#ifdef Q_OS_MACOS
+        // Qt's macOS clipboard backend drops the text flavor from a
+        // QMimeData that also carries an image, so compound writes go
+        // through the native pasteboard instead.
+        rememberClipboard(QString::fromUtf8(text).toUtf8(), image);
+        if (ClipboardHelperWritePasteboardCompound(
+                text.constData(), reinterpret_cast<const unsigned char*>(png.constData()),
+                png.size())) {
+            ClipboardLog::debug("ClipboardSync: applied compound clipboard (text %d B + PNG %d B)",
+                         text.size(),
+                         png.size());
+            return;
+        }
+        ClipboardLog::warn("ClipboardSync: native compound pasteboard write failed; falling back to image only");
+#endif
+
+        rememberClipboard(QString::fromUtf8(text).toUtf8(), image);
+
+        QMimeData* mime = new QMimeData();
+        mime->setText(QString::fromUtf8(text));
+        mime->setImageData(image);
+        // Provide raw PNG bytes too so apps that prefer image/png over
+        // CF_DIB get the lossless copy verbatim (mirrors applyInboundPng).
+        mime->setData(QStringLiteral("image/png"), png);
+        cb->setMimeData(mime);
+        ClipboardLog::debug("ClipboardSync: applied compound clipboard (text %d B + PNG %d B)",
+                     text.size(),
+                     png.size());
+        return;
+    }
+
+    // One flavor was unusable — degrade to a single-flavor apply (each of
+    // these records its own echo identities).
+    if (textOk) {
+        applyInboundText(text);
+    } else if (!image.isNull()) {
+        applyInboundPng(png);
+    }
 }

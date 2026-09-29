@@ -42,15 +42,15 @@ if /I "%BUILD_CONFIG%"=="debug" (
 
 rem Locate qmake and determine if we're using qmake.exe or (host-)qmake.bat
 rem (host-)qmake.bat is an ARM64 forwarder to the x64 version of qmake.exe
-where qmake.bat
+where /q qmake.bat
 if !ERRORLEVEL! EQU 0 (
     set QMAKE_CMD=call qmake.bat
 ) else (
-    where host-qmake.bat
+    where /q host-qmake.bat
     if !ERRORLEVEL! EQU 0 (
         set QMAKE_CMD=call host-qmake.bat
     ) else (
-        where qmake.exe
+        where /q qmake.exe
         if !ERRORLEVEL! EQU 0 (
             set QMAKE_CMD=qmake.exe
         ) else (
@@ -61,11 +61,25 @@ if !ERRORLEVEL! EQU 0 (
 )
 
 rem Find Qt path to determine our architecture
-for /F %%i in ('where qmake') do set QT_PATH=%%i
+set QT_PATH=
+if /I "%QMAKE_CMD%"=="call qmake.bat" (
+    for /F "delims=" %%i in ('where qmake.bat') do if not defined QT_PATH set "QT_PATH=%%i"
+) else (
+    if /I "%QMAKE_CMD%"=="call host-qmake.bat" (
+        for /F "delims=" %%i in ('where host-qmake.bat') do if not defined QT_PATH set "QT_PATH=%%i"
+    ) else (
+        for /F "delims=" %%i in ('where qmake.exe') do if not defined QT_PATH set "QT_PATH=%%i"
+    )
+)
+if not defined QT_PATH (
+    echo Unable to resolve QMake path.
+    goto Error
+)
 
 rem Strip the qmake filename off the end to get the Qt bin directory itself
 set QT_PATH=%QT_PATH:\qmake.exe=%
 set QT_PATH=%QT_PATH:\qmake.bat=%
+set QT_PATH=%QT_PATH:\host-qmake.bat=%
 set QT_PATH=%QT_PATH:\qmake.cmd=%
 
 echo QT_PATH=%QT_PATH%
@@ -80,12 +94,12 @@ if /I "%BUILD_ARCH%"=="arm64" (
         echo Using windeployqt.exe from HOSTBIN_PATH
         set WINDEPLOYQT_CMD=!HOSTBIN_PATH!\windeployqt.exe --qtpaths %QT_PATH%\host-qtpaths.bat
     ) else (
-        if exist %QT_PATH%\windeployqt.exe (
-            echo Using windeployqt.exe from QT_PATH
-            set WINDEPLOYQT_CMD=windeployqt.exe
-        ) else (
+        if exist %QT_PATH%\qtpaths.bat (
             echo Using windeployqt.exe from HOSTBIN_PATH
             set WINDEPLOYQT_CMD=!HOSTBIN_PATH!\windeployqt.exe --qtpaths %QT_PATH%\qtpaths.bat
+        ) else (
+            echo Using windeployqt.exe from QT_PATH
+            set WINDEPLOYQT_CMD=%QT_PATH%\windeployqt.exe
         )
     )
 ) else (
@@ -121,7 +135,8 @@ if /I "%VC_ARCH%" NEQ "%PROCESSOR_ARCHITECTURE%" (
 )
 
 rem Find Visual Studio and run vcvarsall.bat
-set VSWHERE="%SOURCE_ROOT%\scripts\vswhere.exe"
+call "%SOURCE_ROOT%\scripts\find-vswhere.bat"
+if !ERRORLEVEL! NEQ 0 goto Error
 for /f "usebackq delims=" %%i in (`%VSWHERE% -latest -property installationPath`) do (
     call "%%i\VC\Auxiliary\Build\vcvarsall.bat" %VC_ARCH%
 )
@@ -129,6 +144,7 @@ if !ERRORLEVEL! NEQ 0 goto Error
 
 rem Find VC redistributable DLLs
 for /f "usebackq delims=" %%i in (`%VSWHERE% -latest -find VC\Redist\MSVC\*\%ARCH%\Microsoft.VC*.CRT`) do set VC_REDIST_DLL_PATH=%%i
+if !ERRORLEVEL! NEQ 0 goto Error
 
 echo Cleaning output directories
 rmdir /s /q %DEPLOY_FOLDER%
@@ -152,9 +168,30 @@ pushd %BUILD_FOLDER%
 if !ERRORLEVEL! NEQ 0 goto Error
 popd
 
+rem Locate jom.exe or fall back to nmake.exe
+where /q jom.exe
+if !ERRORLEVEL! EQU 0 (
+    set JOM_CMD=jom.exe
+) else if exist "%QT_PATH%\..\..\..\Tools\QtCreator\bin\jom\jom.exe" (
+    set JOM_CMD="%QT_PATH%\..\..\..\Tools\QtCreator\bin\jom\jom.exe"
+) else if exist "%QT_PATH%\..\..\..\Tools\QtCreator\bin\jom.exe" (
+    set JOM_CMD="%QT_PATH%\..\..\..\Tools\QtCreator\bin\jom.exe"
+) else if exist "%QT_PATH%\..\..\..\Tools\jom\jom.exe" (
+    set JOM_CMD="%QT_PATH%\..\..\..\Tools\jom\jom.exe"
+) else (
+    where /q nmake.exe
+    if !ERRORLEVEL! EQU 0 (
+        echo jom.exe not found. Falling back to nmake.exe.
+        set JOM_CMD=nmake.exe
+    ) else (
+        echo Unable to find jom.exe or nmake.exe!
+        goto Error
+    )
+)
+
 echo Compiling Moonlight in %BUILD_CONFIG% configuration
 pushd %BUILD_FOLDER%
-%SOURCE_ROOT%\scripts\jom.exe %BUILD_CONFIG%
+!JOM_CMD! %BUILD_CONFIG%
 if !ERRORLEVEL! NEQ 0 goto Error
 popd
 
@@ -198,6 +235,10 @@ echo Copying AntiHooking.dll
 copy %BUILD_FOLDER%\AntiHooking\%BUILD_CONFIG%\AntiHooking.dll %DEPLOY_FOLDER%
 if !ERRORLEVEL! NEQ 0 goto Error
 
+echo Copying clipboard helper
+copy %BUILD_FOLDER%\clipboard-helper\%BUILD_CONFIG%\moonlight-clipboard-helper.exe %DEPLOY_FOLDER%
+if !ERRORLEVEL! NEQ 0 goto Error
+
 echo Copying GC mapping list
 copy %SOURCE_ROOT%\app\SDL_GameControllerDB\gamecontrollerdb.txt %DEPLOY_FOLDER%
 if !ERRORLEVEL! NEQ 0 goto Error
@@ -212,8 +253,10 @@ if not x%QT_PATH:\5.=%==x%QT_PATH% (
 ) else (
     rem Qt 6.8+
     set WINDEPLOYQT_ARGS=--no-system-d3d-compiler --no-system-dxc-compiler --skip-plugin-types qmltooling,generic --no-ffmpeg
-    set WINDEPLOYQT_ARGS=!WINDEPLOYQT_ARGS! --no-quickcontrols2fusion --no-quickcontrols2imagine --no-quickcontrols2universal
-    set WINDEPLOYQT_ARGS=!WINDEPLOYQT_ARGS! --no-quickcontrols2fusionstyleimpl --no-quickcontrols2imaginestyleimpl --no-quickcontrols2universalstyleimpl --no-quickcontrols2windowsstyleimpl --no-quickcontrols2fluentwinui3styleimpl
+    rem FluentWinUI3 depends on the Fusion fallback style, so deploy both styles
+    rem and their implementation libraries.
+    set WINDEPLOYQT_ARGS=!WINDEPLOYQT_ARGS! --no-quickcontrols2imagine --no-quickcontrols2universal
+    set WINDEPLOYQT_ARGS=!WINDEPLOYQT_ARGS! --no-quickcontrols2imaginestyleimpl --no-quickcontrols2universalstyleimpl --no-quickcontrols2windowsstyleimpl
 )
 
 echo Deploying Qt dependencies
@@ -225,12 +268,11 @@ rem Qt 5.x directories
 rmdir /s /q %DEPLOY_FOLDER%\QtQuick\Controls.2\Fusion
 rmdir /s /q %DEPLOY_FOLDER%\QtQuick\Controls.2\Imagine
 rmdir /s /q %DEPLOY_FOLDER%\QtQuick\Controls.2\Universal
-rem Qt 6.8+ directories
-rmdir /s /q %DEPLOY_FOLDER%\qml\QtQuick\Controls\Fusion
+rem Qt 6.8+ directories. FluentWinUI3 is the active style and imports
+rem Fusion as a fallback, so both directories must remain in the bundle.
 rmdir /s /q %DEPLOY_FOLDER%\qml\QtQuick\Controls\Imagine
 rmdir /s /q %DEPLOY_FOLDER%\qml\QtQuick\Controls\Universal
 rmdir /s /q %DEPLOY_FOLDER%\qml\QtQuick\Controls\Windows
-rmdir /s /q %DEPLOY_FOLDER%\qml\QtQuick\Controls\FluentWinUI3
 rmdir /s /q %DEPLOY_FOLDER%\qml\QtQuick\NativeStyle
 rem icuuc.dll ships with all supported OSes (and Qt incorrectly deploys the x64 version on ARM64)
 del %DEPLOY_FOLDER%\icuuc.dll
@@ -266,11 +308,16 @@ rem This must be done after WiX harvesting and signing, since the VCRT dlls are 
 rem and should not be harvested for inclusion in the full installer
 copy "%VC_REDIST_DLL_PATH%\*.dll" %DEPLOY_FOLDER%
 if !ERRORLEVEL! NEQ 0 goto Error
+if /I "%ARCH%"=="arm64" (
+    rem The ARM64 MSVC redist can include an x64-only vcruntime140_1.dll. Moonlight
+    rem and the bundled ARM64 DLLs do not import it, and shipping it breaks launch.
+    del /f /q "%DEPLOY_FOLDER%\vcruntime140_1.dll"
+)
 
-rem Since we don't publish Windows installers for CI builds, let's use the user profile
-rem location of the regular non-portable version by default. We'll place a file in the
-rem the package to allow the user to rename if they want portable behavior.
-if defined CI_VERSION (
+rem Portable packages should be portable by default. CI_VERSION is only used to
+rem pin artifact versions, so use an explicit opt-out when a CI/debug package
+rem should default to the normal per-user settings location.
+if defined MOONLIGHT_PORTABLE_INACTIVE (
     echo. > %DEPLOY_FOLDER%\portable.dat.inactive
     if !ERRORLEVEL! NEQ 0 goto Error
 ) else (
@@ -279,10 +326,15 @@ if defined CI_VERSION (
     if !ERRORLEVEL! NEQ 0 goto Error
 )
 
-7z a %INSTALLER_FOLDER%\MoonlightPortable-%ARCH%-%VERSION%.zip %DEPLOY_FOLDER%\*
+7z a %INSTALLER_FOLDER%\Moonlight-VPlus-Portable-%ARCH%-%VERSION%.zip %DEPLOY_FOLDER%\*
 if !ERRORLEVEL! NEQ 0 goto Error
 
-echo Build successful for Moonlight v%VERSION% %ARCH% binaries!
+rem Keep one legacy-named alias so pre-rebrand portable clients can install
+rem the first Moonlight V+ update in-app.
+copy /Y %INSTALLER_FOLDER%\Moonlight-VPlus-Portable-%ARCH%-%VERSION%.zip %INSTALLER_FOLDER%\MoonlightPortable-%ARCH%-%VERSION%.zip
+if !ERRORLEVEL! NEQ 0 goto Error
+
+echo Build successful for Moonlight V+ for PC v%VERSION% %ARCH% binaries!
 exit /b 0
 
 :Error

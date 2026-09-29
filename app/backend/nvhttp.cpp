@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <memory>
 
 #define FAST_FAIL_TIMEOUT_MS 2000
 #define REQUEST_TIMEOUT_MS 5000
@@ -28,9 +29,10 @@
 #define XML_NAME_EQUALS(x, y) ((x) == (u##y))
 #endif
 
-NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, QNetworkAccessManager* nam, QString uuid) :
+NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, bool useTrueUid, QNetworkAccessManager* nam, QString uuid) :
     m_Nam(nam ? nam : new QNetworkAccessManager(this)),
     m_ServerCert(serverCert),
+    m_UseTrueUid(useTrueUid),
     m_Uuid(uuid)
 {
     m_BaseUrlHttp.setScheme("http");
@@ -45,9 +47,8 @@ NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert
 }
 
 NvHTTP::NvHTTP(NvComputer* computer, QNetworkAccessManager* nam) :
-    NvHTTP(computer->activeAddress, computer->activeHttpsPort, computer->serverCert, nam, computer->uuid)
+    NvHTTP(computer->activeAddress, computer->activeHttpsPort, computer->serverCert, !computer->isNvidiaServerSoftware, nam, computer->uuid)
 {
-
 }
 
 void NvHTTP::setServerCert(QSslCertificate serverCert)
@@ -70,6 +71,16 @@ void NvHTTP::setAddress(NvAddress address)
 void NvHTTP::setHttpsPort(uint16_t port)
 {
     m_BaseUrlHttps.setPort(port);
+}
+
+void NvHTTP::setTrueUid(bool useTrueUid)
+{
+    m_UseTrueUid = useTrueUid;
+}
+
+void NvHTTP::setHostUuid(QString uuid)
+{
+    m_Uuid = uuid;
 }
 
 NvAddress NvHTTP::address()
@@ -206,8 +217,9 @@ NvHTTP::startApp(QString verb,
                  int gamepadMask,
                  bool persistGameControllersOnDisconnect,
                  QString& rtspSessionUrl,
-                 int customScreenMode,
-                 int customVddScreenMode,
+                 int screenCombinationMode,
+                 const std::optional<bool>& useVdd,
+                 const QString& displayName,
                  RemoteStreamConfig &remoteStreamConfig)
 {
     int riKeyId;
@@ -244,34 +256,53 @@ NvHTTP::startApp(QString verb,
         }
     }
 
-    QString response =
-            openConnectionToString(m_BaseUrlHttps,
-                                   verb,
-                                   "appid="+QString::number(appId)+
-                                   "&mode="+appWidth+"x"+
-                                   appHeight+"x"+
-                                   appFps +
-                                   "&additionalStates=1&sops="+QString::number(sops ? 1 : 0)+
-                                   "&rikey="+QByteArray(streamConfig->remoteInputAesKey, sizeof(streamConfig->remoteInputAesKey)).toHex()+
-                                   "&rikeyid="+QString::number(riKeyId)+
-                                   ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
-                                       "&hdrMode="+QString::number(streamConfig->hdrMode)+
-                                       "&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
-                                        "")+
-                                   "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
-                                   "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
-                                   "&remoteControllersBitmap="+QString::number(gamepadMask)+
-                                   "&gcmap="+QString::number(gamepadMask)+
-                                   "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
-                                   "&customScreenMode="+QString::number(customScreenMode)+
-                                   "&customVddScreenMode="+QString::number(customVddScreenMode)+
-                                   ((remoteStreamConfig.maxBrightness > 0) ?
-                                       "&maxBrightness="+QString::number(remoteStreamConfig.maxBrightness, 'f', 3)+
-                                       "&minBrightness="+QString::number(remoteStreamConfig.minBrightness, 'f', 6)+
-                                       "&maxAverageBrightness="+QString::number(remoteStreamConfig.maxAverageBrightness, 'f', 3) :
-                                        "")+
-                                   LiGetLaunchUrlQueryParameters(),
-                                   LAUNCH_TIMEOUT_MS);
+    QString query =
+            "appid="+QString::number(appId)+
+            "&mode="+appWidth+"x"+
+            appHeight+"x"+
+            appFps+
+            "&additionalStates=1&sops="+QString::number(sops ? 1 : 0)+
+            "&rikey="+QByteArray(streamConfig->remoteInputAesKey, sizeof(streamConfig->remoteInputAesKey)).toHex()+
+            "&rikeyid="+QString::number(riKeyId)+
+            ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
+                "&hdrMode="+QString::number(streamConfig->hdrMode)+
+                "&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
+                 "")+
+            "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
+            "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
+            "&remoteControllersBitmap="+QString::number(gamepadMask)+
+            "&gcmap="+QString::number(gamepadMask)+
+            "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0);
+
+    if (screenCombinationMode != -1) {
+        query += "&customScreenMode="+QString::number(screenCombinationMode);
+    }
+    if (useVdd.has_value()) {
+        query += "&useVdd="+QString::number(*useVdd ? 1 : 0);
+    }
+    if (!displayName.isEmpty()) {
+        query += "&display_name="+QString::fromLatin1(QUrl::toPercentEncoding(displayName));
+    }
+    if (remoteStreamConfig.maxBrightness > 0) {
+        query += "&maxBrightness="+QString::number(remoteStreamConfig.maxBrightness, 'f', 3)+
+                 "&minBrightness="+QString::number(remoteStreamConfig.minBrightness, 'f', 6)+
+                 "&maxAverageBrightness="+QString::number(remoteStreamConfig.maxAverageBrightness, 'f', 3);
+    }
+    if (remoteStreamConfig.sdrWhiteBrightness >= 50.0f &&
+            remoteStreamConfig.sdrWhiteBrightness <= 1000.0f) {
+        // Foundation Sunshine parses this extension as an integer number of
+        // nits. It uses the value to re-anchor SDR-referred content before
+        // converting the host's scRGB desktop to the negotiated HDR transfer.
+        query += "&sdrBrightness="+
+                 QString::number(qRound(remoteStreamConfig.sdrWhiteBrightness));
+    }
+
+    query += LiGetLaunchUrlQueryParameters();
+
+    QString response = openConnectionToString(m_BaseUrlHttps,
+                                              verb,
+                                              query,
+                                              LAUNCH_TIMEOUT_MS);
 
     qInfo() << "Launch response:" << response;
 
@@ -358,7 +389,16 @@ NvHTTP::getAppList()
             }
             else if (!apps.isEmpty()) {
                 if (XML_NAME_EQUALS(name, "AppTitle")) {
-                    apps.last().name = xmlReader.readElementText();
+                    // If an app has no name, Sunshine may send us <AppTitle/>,
+                    // which readElementText() returns as a null QString.
+                    // We want to treat this as an empty QString instead, so we
+                    // will explicitly convert it. An empty string will satisfy
+                    // NvApp's isInitialized() check.
+                    QString name = xmlReader.readElementText();
+                    if (name.isNull()) {
+                        name = "";
+                    }
+                    apps.last().name = name;
                 }
                 else if (XML_NAME_EQUALS(name, "ID")) {
                     apps.last().id = xmlReader.readElementText().toInt();
@@ -406,19 +446,24 @@ NvHTTP::getDisplays()
         for (int i = 0; i < displaysArray.size(); i++) {
             QJsonObject displayObj = displaysArray[i].toObject();
 
+            const QString displayName = displayObj.value("display_name").toString();
             QString friendlyName = displayObj.value("friendly_name").toString();
             if (friendlyName.isEmpty()) {
-                friendlyName = displayObj.value("display_name").toString();
+                friendlyName = displayName;
             }
             if (friendlyName.isEmpty()) {
                 friendlyName = QString("Display %1").arg(i + 1);
             }
 
-            QString guid = displayObj.value("device_id").toString();
+            QString displayTarget = displayObj.value("device_id").toString();
+            if (displayTarget.isEmpty()) {
+                displayTarget = displayName.isEmpty() ? friendlyName : displayName;
+            }
 
             QVariantMap display;
             display["name"] = friendlyName;
-            display["guid"] = guid;
+            display["id"] = QStringLiteral("physical:%1:%2").arg(i).arg(displayTarget);
+            display["target"] = displayTarget;
             display["index"] = i;
             displays.append(display);
         }
@@ -558,6 +603,26 @@ NvHTTP::openConnectionToString(QUrl baseUrl,
     return ret;
 }
 
+UsbForwarding::Capability NvHTTP::getUsbForwardingCapability()
+{
+    if (m_ServerCert.isNull() || httpsPort() == 0) {
+        throw GfeHttpResponseException(401, "USB forwarding requires a paired host");
+    }
+    std::unique_ptr<QNetworkReply> reply(openConnection(m_BaseUrlHttps,
+        "api/v1/usb-forwarding", QString(), 5000, NVLL_NONE, 4096));
+    // A normally trusted certificate may not emit sslErrors at all. Require
+    // the paired leaf certificate even on that path before accepting credentials.
+    if (reply->sslConfiguration().peerCertificate() != m_ServerCert) {
+        throw GfeHttpResponseException(401, "USB forwarding host certificate mismatch");
+    }
+    if (reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200) {
+        throw GfeHttpResponseException(400, "USB capability request failed");
+    }
+    const auto capability = UsbForwarding::Capability::parse(reply->readAll());
+    if (!capability) throw GfeHttpResponseException(400, "Invalid USB capability response");
+    return *capability;
+}
+
 bool
 NvHTTP::getAbrCapabilities(int* hostMaxBitrateKbps)
 {
@@ -625,7 +690,8 @@ NvHTTP::openConnection(QUrl baseUrl,
                        QString command,
                        QString arguments,
                        int timeoutMs,
-                       NvLogLevel logLevel)
+                       NvLogLevel logLevel,
+                       qint64 maxResponseBytes)
 {
     // Port must be set
     Q_ASSERT(baseUrl.port(0) != 0);
@@ -634,10 +700,6 @@ NvHTTP::openConnection(QUrl baseUrl,
     QUrl url(baseUrl);
     url.setPath("/" + command);
 
-    // Use a common UID for Moonlight clients to allow them to quit
-    // games for each other (otherwise GFE gets screwed up and it requires
-    // manual intervention to solve).
-    
     // Get clientname - prefer pairname if available, otherwise use local hostname
     QString clientname = QHostInfo::localHostName().toUtf8();
     if (!m_Uuid.isEmpty()) {
@@ -648,13 +710,19 @@ NvHTTP::openConnection(QUrl baseUrl,
     }
 
     qInfo() << "clientname:" << clientname;
-    
-    url.setQuery("uniqueid=0123456789ABCDEF&uuid=" +
-                 QUuid::createUuid().toRfc4122().toHex() +
+
+    // Use a placeholder UID for GFE allow them to quit games for each other.
+    url.setQuery("uniqueid=" + (m_UseTrueUid ? IdentityManager::get()->getUniqueId() : "0123456789ABCDEF") +
+                 "&uuid=" + QUuid::createUuid().toRfc4122().toHex() +
                  "&clientname=" + clientname +
-                 ((arguments != nullptr) ? ("&" + arguments) : ""));
+                 (!arguments.isNull() ? ("&" + arguments) : ""));
 
     QNetworkRequest request(url);
+
+    if (maxResponseBytes > 0) {
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                             QNetworkRequest::ManualRedirectPolicy);
+    }
 
     // Add our client certificate
     request.setSslConfiguration(IdentityManager::get()->getSslConfig());
@@ -676,6 +744,16 @@ NvHTTP::openConnection(QUrl baseUrl,
 
     // Run the request with a timeout if requested
     QEventLoop loop;
+    bool oversized = false;
+    if (maxResponseBytes > 0) {
+        reply->setReadBufferSize(maxResponseBytes + 1);
+        connect(reply, &QNetworkReply::readyRead, &loop, [&] {
+            if (reply->bytesAvailable() > maxResponseBytes) {
+                oversized = true;
+                reply->abort();
+            }
+        });
+    }
     connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, &loop, &QEventLoop::quit);
     if (timeoutMs) {
@@ -702,6 +780,10 @@ NvHTTP::openConnection(QUrl baseUrl,
     disconnect(sslErrorsConnection);
 
     // Handle error
+    if (oversized) {
+        delete reply;
+        throw GfeHttpResponseException(400, "USB capability response too large");
+    }
     if (reply->error() != QNetworkReply::NoError)
     {
         if (logLevel >= NvLogLevel::NVLL_ERROR) {

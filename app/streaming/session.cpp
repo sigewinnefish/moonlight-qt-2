@@ -1,10 +1,22 @@
 #include "session.h"
-#include "clipboardsync.h"
+#include "clipboardhelperclient.h"
+#include "filemappingclient.h"
+#include "filemappingux.h"
 #include "settings/streamingpreferences.h"
 #include "streaming/streamutils.h"
+#include "streaming/audio/dualsensehaptics.h"
+#include "streaming/audio/dualsensehapticscalibration.h"
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+#include "streaming/input/stylusreplaytest.h"
+#include "streaming/input/gamepadglyphs.h"
+#endif
 #include "backend/richpresencemanager.h"
 #include "backend/nvhttp.h"
 #include "backend/identitymanager.h"
+#include "backend/usbforwardingbackend.h"
+#include "backend/usbforwardingenvironment.h"
+#include "backend/usbforwardinglocalserver.h"
+#include "gui/windowsdisplaygeometry.h"
 
 #include <Limelight.h>
 #include "SDL_compat.h"
@@ -12,9 +24,14 @@
 #include "utils.h"
 #include <QCoreApplication>
 #include <QHostInfo>
+#include <QThread>
 
 #ifdef HAVE_FFMPEG
 #include "video/ffmpeg.h"
+#endif
+
+#ifdef Q_OS_DARWIN
+#include "streaming/video/macqteventpumpinputguard.h"
 #endif
 
 #ifdef HAVE_SLVIDEO
@@ -24,6 +41,7 @@
 #ifdef Q_OS_WIN32
 // Scaling the icon down on Win32 looks dreadful, so render at lower res
 #define ICON_SIZE 32
+#include <windows.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #else
@@ -36,19 +54,311 @@
 #define SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE 103
 #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
 #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
+#define SDL_CODE_FLUSH_TOUCHPAD_FRAME 106
+#define SDL_CODE_CURSOR_UPDATE 107
+#define SDL_CODE_FLUSH_CURSOR_VISIBILITY 108
+#if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || \
+        defined(HAVE_LINUX_DISPLAY_EVENT_MONITOR)
+#define SDL_CODE_PROCESS_QT_OVERLAY_EVENTS 109
+#endif
 
 #include <openssl/rand.h>
 
 #include <QtEndian>
 #include <QCoreApplication>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFileInfo>
 #include <QThreadPool>
 #include <QRunnable>
+#include <QReadLocker>
 #include <QSvgRenderer>
 #include <QPainter>
 #include <QImage>
 #include <QGuiApplication>
 #include <QCursor>
+#include <QProcess>
 #include <QScreen>
+#include <QtGlobal>
+#include <QMutexLocker>
+#include <QUuid>
+#include <QElapsedTimer>
+#include <QUrl>
+
+#include <utility>
+#include <vector>
+
+namespace {
+
+int SDLCALL keepNonRumbleEvent(void*, SDL_Event* event)
+{
+    return event->type != SDL_USEREVENT ||
+           (event->user.code != SDL_CODE_GAMECONTROLLER_RUMBLE &&
+            event->user.code != SDL_CODE_GAMECONTROLLER_RUMBLE_TRIGGERS);
+}
+
+void stopControllerRumbleAtConnectionBoundary(SdlInputHandler* inputHandler)
+{
+    SDL_FilterEvents(keepNonRumbleEvent, nullptr);
+    if (inputHandler != nullptr) {
+        inputHandler->stopAllRumble();
+    }
+}
+
+QRect qtWindowCreationGeometryForSdl(QWindow* window)
+{
+    if (!window) {
+        return {};
+    }
+
+#ifdef Q_OS_WIN32
+    const QRect nativeFrame = WindowsDisplayGeometry::windowRect(window);
+    QRect nativeClient;
+    if (WindowsDisplayGeometry::clientRectForOverlappedWindow(
+                window, nativeFrame, nativeClient)) {
+        return nativeClient;
+    }
+#endif
+
+    const QRect client = window->geometry();
+#ifdef Q_OS_DARWIN
+    return client;
+#else
+    const qreal scale = window->devicePixelRatio();
+    return QRect(qRound(client.x() * scale),
+                 qRound(client.y() * scale),
+                 qMax(1, qRound(client.width() * scale)),
+                 qMax(1, qRound(client.height() * scale)));
+#endif
+}
+
+enum class SdlDisplayMatchPolicy
+{
+    AllowFallback,
+    ExactOnly,
+};
+
+QScreen* qtScreenForSdlDisplay(int displayIndex,
+                               SdlDisplayMatchPolicy matchPolicy = SdlDisplayMatchPolicy::AllowFallback)
+{
+    if (displayIndex < 0) {
+        return nullptr;
+    }
+
+    const char* displayName = SDL_GetDisplayName(displayIndex);
+    const QString name = displayName ? QString::fromUtf8(displayName) : QString();
+
+#ifdef Q_OS_WIN32
+    WindowsDisplayGeometry::Monitor monitor;
+    if (WindowsDisplayGeometry::monitorForName(name, monitor)) {
+        if (QScreen* screen = WindowsDisplayGeometry::screenForMonitor(monitor)) {
+            return screen;
+        }
+    }
+#endif
+
+    const auto screens = QGuiApplication::screens();
+    for (QScreen* screen : screens) {
+        if (screen && screen->name().compare(name, Qt::CaseInsensitive) == 0) {
+            return screen;
+        }
+    }
+
+    SDL_Rect displayBounds;
+    if (SDL_GetDisplayBounds(displayIndex, &displayBounds) == 0) {
+        const QRect sdlBounds(displayBounds.x, displayBounds.y,
+                              displayBounds.w, displayBounds.h);
+        QList<QScreen*> sizeMatches;
+        for (QScreen* screen : screens) {
+            if (!screen) {
+                continue;
+            }
+            if (screen->geometry() == sdlBounds) {
+                return screen;
+            }
+
+            const qreal scale = screen->devicePixelRatio();
+            const QSize nativeSize(qRound(screen->geometry().width() * scale),
+                                   qRound(screen->geometry().height() * scale));
+            if (nativeSize == sdlBounds.size()) {
+                sizeMatches.append(screen);
+            }
+        }
+
+        if (sizeMatches.size() == 1) {
+            return sizeMatches.first();
+        }
+        if (matchPolicy == SdlDisplayMatchPolicy::AllowFallback) {
+            if (QScreen* cursorScreen = QGuiApplication::screenAt(QCursor::pos())) {
+                if (sizeMatches.contains(cursorScreen)) {
+                    return cursorScreen;
+                }
+            }
+        }
+    }
+
+    if (matchPolicy == SdlDisplayMatchPolicy::ExactOnly) {
+        return nullptr;
+    }
+
+    if (QScreen* cursorScreen = QGuiApplication::screenAt(QCursor::pos())) {
+        return cursorScreen;
+    }
+    return QGuiApplication::primaryScreen();
+}
+
+QRect qtOverlayGeometryForSdlWindow(SDL_Window* window)
+{
+    if (!window) {
+        return {};
+    }
+
+    int x, y, width, height;
+    SDL_GetWindowPosition(window, &x, &y);
+    SDL_GetWindowSize(window, &width, &height);
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+
+    const int displayIndex = SDL_GetWindowDisplayIndex(window);
+
+#ifdef Q_OS_DARWIN
+    return QRect(x, y, width, height);
+#else
+#ifdef Q_OS_WIN32
+    WindowsDisplayGeometry::Monitor monitor;
+    if (WindowsDisplayGeometry::monitorForRect(
+                QRect(x, y, width, height), monitor)) {
+        QScreen* screen = WindowsDisplayGeometry::screenForMonitor(monitor);
+        if (screen) {
+            const qreal scale = WindowsDisplayGeometry::scaleFactor(monitor, screen);
+            const QPoint logicalOrigin = screen->geometry().topLeft();
+            return QRect(logicalOrigin.x() + qRound((x - monitor.bounds.left()) / scale),
+                         logicalOrigin.y() + qRound((y - monitor.bounds.top()) / scale),
+                         qMax(1, qRound(width / scale)),
+                         qMax(1, qRound(height / scale)));
+        }
+    }
+#endif
+
+    QScreen* screen = qtScreenForSdlDisplay(displayIndex);
+    SDL_Rect displayBounds;
+    if (screen && displayIndex >= 0 &&
+            SDL_GetDisplayBounds(displayIndex, &displayBounds) == 0) {
+        const qreal scale = screen->devicePixelRatio();
+        const QPoint logicalOrigin = screen->geometry().topLeft();
+        return QRect(logicalOrigin.x() + qRound((x - displayBounds.x) / scale),
+                     logicalOrigin.y() + qRound((y - displayBounds.y) / scale),
+                     qMax(1, qRound(width / scale)),
+                     qMax(1, qRound(height / scale)));
+    }
+
+    // Keep the overlay available if platform display metadata is incomplete.
+    // At this point screen is the cursor screen or the primary screen.
+    if (screen) {
+        const qreal scale = screen->devicePixelRatio();
+        const QSize logicalSize(qMax(1, qRound(width / scale)),
+                                qMax(1, qRound(height / scale)));
+        return QRect(screen->geometry().topLeft(), logicalSize);
+    }
+
+    return QRect(x, y, width, height);
+#endif
+}
+
+// SDL 事件队列默认容量不小,但满的时候 SDL_PushEvent 会静默失败。这里排队
+// 的事件丢了症状都很隐蔽(震动失灵、传感器停发、重连后画面不恢复等),
+// 所以至少把失败写进日志。
+static void pushEventOrWarn(SDL_Event& event)
+{
+    if (SDL_PushEvent(&event) < 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to queue SDL event (type=0x%x): %s",
+                    event.type, SDL_GetError());
+    }
+}
+
+// 退出组合键的 glyph 文案,按键名按手柄 UI 风格显示
+// (与 StreamSegue.qml 的 quitComboHintText 保持同一映射)
+static QString gamepadQuitComboGlyphText(GamepadUiStyle style,
+                                         StreamingPreferences::GamepadQuitCombo combo,
+                                         bool swapFaceButtons)
+{
+    QString lb = gamepadLeftShoulderName(style);
+    QString rb = gamepadRightShoulderName(style);
+    // swapFaceButtons 在组合键匹配前交换事件,提示必须显示"要按的那颗物理
+    // 键":逻辑面键取对侧位置(0↔1、2↔3)
+    auto face = [style, swapFaceButtons](int logicalButton) {
+        return gamepadFaceButtonGlyph(style, swapFaceButtons ? (logicalButton ^ 1) : logicalButton);
+    };
+
+    switch (combo) {
+    case StreamingPreferences::GQC_SELECT_L1_R1_Y:
+        return gamepadSelectButtonName(style) + "+" + lb + "+" + rb + "+" + face(3);
+    case StreamingPreferences::GQC_START_L1_R1_A:
+        return gamepadStartButtonName(style) + "+" + lb + "+" + rb + "+" + face(0);
+    case StreamingPreferences::GQC_START_L1_R1_B:
+        return gamepadStartButtonName(style) + "+" + lb + "+" + rb + "+" + face(1);
+    case StreamingPreferences::GQC_L1_R1_X_Y:
+        return lb + "+" + rb + "+" + face(2) + "+" + face(3);
+    case StreamingPreferences::GQC_L1_R1_A_B:
+        return lb + "+" + rb + "+" + face(0) + "+" + face(1);
+    case StreamingPreferences::GQC_DEFAULT:
+    default:
+        return gamepadStartButtonName(style) + "+" + gamepadSelectButtonName(style) + "+" + lb +
+               "+" + rb;
+    }
+}
+
+OverlayMenuPanel::MenuAction menuPlacementActionForPreference(
+        StreamingPreferences::OverlayMenuPosition position)
+{
+    switch (position) {
+    case StreamingPreferences::OMP_TOP_EDGE:
+        return OverlayMenuPanel::MenuAction::SetMenuPlacementTop;
+    case StreamingPreferences::OMP_RIGHT_EDGE:
+        return OverlayMenuPanel::MenuAction::SetMenuPlacementRight;
+    case StreamingPreferences::OMP_LEFT_EDGE:
+        return OverlayMenuPanel::MenuAction::SetMenuPlacementLeft;
+    case StreamingPreferences::OMP_BUTTON:
+        return OverlayMenuPanel::MenuAction::SetMenuPlacementButton;
+    case StreamingPreferences::OMP_DISABLED:
+    default:
+        return OverlayMenuPanel::MenuAction::SetMenuPlacementDisabled;
+    }
+}
+
+std::optional<StreamingPreferences::OverlayMenuPosition> menuPlacementForAction(
+        OverlayMenuPanel::MenuAction action)
+{
+    switch (action) {
+    case OverlayMenuPanel::MenuAction::SetMenuPlacementTop:
+        return StreamingPreferences::OMP_TOP_EDGE;
+    case OverlayMenuPanel::MenuAction::SetMenuPlacementRight:
+        return StreamingPreferences::OMP_RIGHT_EDGE;
+    case OverlayMenuPanel::MenuAction::SetMenuPlacementLeft:
+        return StreamingPreferences::OMP_LEFT_EDGE;
+    case OverlayMenuPanel::MenuAction::SetMenuPlacementButton:
+        return StreamingPreferences::OMP_BUTTON;
+    case OverlayMenuPanel::MenuAction::SetMenuPlacementDisabled:
+        return StreamingPreferences::OMP_DISABLED;
+    default:
+        return std::nullopt;
+    }
+}
+
+#ifdef Q_OS_WIN32
+bool qtWindowNativeMonitorBounds(QWindow* window, QRect& bounds)
+{
+    WindowsDisplayGeometry::Monitor monitor;
+    if (!WindowsDisplayGeometry::monitorForWindow(window, monitor)) {
+        return false;
+    }
+
+    bounds = monitor.bounds;
+    return bounds.isValid();
+}
+#endif
+}
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QQuickOpenGLUtils>
@@ -71,7 +381,10 @@ CONNECTION_LISTENER_CALLBACKS Session::k_ConnCallbacks = {
     Session::clSetControllerLED,
     Session::clSetAdaptiveTriggers,
     nullptr, // resolutionChanged (unused on Qt client)
-    Session::clClipboardData
+    Session::clClipboardData,
+    Session::clCursorUpdate,
+    nullptr,
+    nullptr
 };
 
 Session* Session::s_ActiveSession;
@@ -106,7 +419,7 @@ public:
     virtual void run() override
     {
         try {
-            NvHTTP http(m_Address, m_HttpsPort, m_ServerCert, nullptr, m_Uuid);
+            NvHTTP http(m_Address, m_HttpsPort, m_ServerCert, true, nullptr, m_Uuid);
             QJsonObject response = http.sendAbrFeedback(m_PacketLoss,
                                                         m_RttMs,
                                                         m_DecodeFps,
@@ -139,6 +452,103 @@ private:
     std::shared_ptr<std::atomic_bool> m_InFlight;
     std::shared_ptr<std::atomic_int> m_CurrentBitrateKbps;
 };
+
+QString fileMappingStateName(OverlayMenuPanel::FileMappingState state)
+{
+    return FileMappingUx::stateName(state);
+}
+
+QString appendFileMappingDiagnostic(const QString& event,
+                                    const QString& detail = QString(),
+                                    const QString& hostUuid = QString(),
+                                    const QString& sessionId = QString())
+{
+    return FileMappingUx::appendDiagnostic(event, detail, hostUuid, sessionId);
+}
+
+bool isFileMappingPathInsideDirectory(const QString& path, const QString& directory)
+{
+    const QString target = QDir::cleanPath(QFileInfo(path).canonicalFilePath());
+    const QString base = QDir::cleanPath(QFileInfo(directory).canonicalFilePath());
+    if (target.isEmpty() || base.isEmpty()) {
+        return false;
+    }
+
+#if defined(Q_OS_WIN)
+    return target.compare(base, Qt::CaseInsensitive) == 0 ||
+           target.startsWith(base + QLatin1Char('/'), Qt::CaseInsensitive);
+#else
+    return target == base || target.startsWith(base + QLatin1Char('/'));
+#endif
+}
+
+bool isMoonlightGeneratedFileMappingMirrorPath(const QString& path)
+{
+    if (path.isEmpty() || QFileInfo(path).fileName() == QStringLiteral("Latest")) {
+        return false;
+    }
+    return isFileMappingPathInsideDirectory(path, FileMappingUx::diagnosticsDirectory());
+}
+
+class FileMappingSmokeTask : public QRunnable
+{
+public:
+    FileMappingSmokeTask(NvComputer computer,
+                         QString mappingId,
+                         QString path,
+                         quint64 offset,
+                         quint32 length,
+                         int timeoutMs)
+        : m_Computer(std::move(computer)),
+          m_MappingId(std::move(mappingId)),
+          m_Path(std::move(path)),
+          m_Offset(offset),
+          m_Length(length),
+          m_TimeoutMs(timeoutMs)
+    {
+    }
+
+    virtual void run() override
+    {
+        FileMappingClient client(&m_Computer);
+        FileMappingClient::SmokeResult result = client.smokeRead(m_MappingId,
+                                                                 m_Path,
+                                                                 m_Offset,
+                                                                 m_Length,
+                                                                 m_TimeoutMs);
+        if (!result.ok) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "File mapping smoke failed: mapping=%s path=%s error=%s",
+                        m_MappingId.toUtf8().constData(),
+                        m_Path.toUtf8().constData(),
+                        result.error.toUtf8().constData());
+            return;
+        }
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "File mapping smoke passed: mapping=%s path=%s",
+                    m_MappingId.toUtf8().constData(),
+                    m_Path.toUtf8().constData());
+    }
+
+private:
+    NvComputer m_Computer;
+    QString m_MappingId;
+    QString m_Path;
+    quint64 m_Offset;
+    quint32 m_Length;
+    int m_TimeoutMs;
+};
+
+int readBoundedEnvInt(const char* name, int fallback, int minimum, int maximum)
+{
+    bool ok = false;
+    int value = qEnvironmentVariableIntValue(name, &ok);
+    if (!ok) {
+        return fallback;
+    }
+    return qBound(minimum, value, maximum);
+}
 
 void Session::clStageStarting(int stage)
 {
@@ -188,10 +598,12 @@ void Session::clConnectionTerminated(int errorCode)
         break;
     }
 
-    // Only attempt reconnect if we were actively streaming (window exists) and
-    // the user didn't request to quit. We must not be mid-reconnect already.
+    // Only attempt reconnect if video actually started and the user didn't request
+    // to quit. A window alone is not enough here: startup failures can create the
+    // SDL window, then terminate before the first frame and otherwise loop forever
+    // behind a black screen.
     if (recoverable &&
-        s_ActiveSession->m_Window != nullptr &&
+        s_ActiveSession->m_HasReceivedVideo &&
         !s_ActiveSession->m_ShouldExit &&
         !s_ActiveSession->m_ConnectionInterrupted) {
 
@@ -206,7 +618,7 @@ void Session::clConnectionTerminated(int errorCode)
         SDL_Event event;
         event.type = SDL_QUIT;
         event.quit.timestamp = SDL_GetTicks();
-        SDL_PushEvent(&event);
+        pushEventOrWarn(event);
         return;
     }
 
@@ -221,7 +633,7 @@ void Session::clConnectionTerminated(int errorCode)
     SDL_Event event;
     event.type = SDL_QUIT;
     event.quit.timestamp = SDL_GetTicks();
-    SDL_PushEvent(&event);
+    pushEventOrWarn(event);
 }
 
 void Session::displayTerminationError(int errorCode)
@@ -286,6 +698,26 @@ void Session::clLogMessage(const char* format, ...)
     va_end(ap);
 }
 
+bool Session::queueTouchpadFrameFlush()
+{
+    // Push an event onto the main loop so touchpad contacts already queued by
+    // SDL can be collected into a single frame before they are sent.
+    SDL_Event flushEvent = {};
+    flushEvent.type = SDL_USEREVENT;
+    flushEvent.user.code = SDL_CODE_FLUSH_TOUCHPAD_FRAME;
+    return SDL_PushEvent(&flushEvent) > 0;
+}
+
+bool Session::queueCursorVisibilityFlush()
+{
+    // Called from SDL's timer thread. Cursor APIs must run on the main thread on
+    // macOS, so bounce back through the event loop.
+    SDL_Event flushEvent = {};
+    flushEvent.type = SDL_USEREVENT;
+    flushEvent.user.code = SDL_CODE_FLUSH_CURSOR_VISIBILITY;
+    return SDL_PushEvent(&flushEvent) > 0;
+}
+
 void Session::clRumble(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor)
 {
     // We push an event for the main thread to handle in order to properly synchronize
@@ -296,7 +728,7 @@ void Session::clRumble(unsigned short controllerNumber, unsigned short lowFreqMo
     rumbleEvent.user.code = SDL_CODE_GAMECONTROLLER_RUMBLE;
     rumbleEvent.user.data1 = (void*)(uintptr_t)controllerNumber;
     rumbleEvent.user.data2 = (void*)(uintptr_t)((lowFreqMotor << 16) | highFreqMotor);
-    SDL_PushEvent(&rumbleEvent);
+    pushEventOrWarn(rumbleEvent);
 }
 
 void Session::clConnectionStatusUpdate(int connectionStatus)
@@ -328,8 +760,12 @@ void Session::clConnectionStatusUpdate(int connectionStatus)
     }
 }
 
-void Session::clSetHdrMode(bool enabled)
+void Session::clSetHdrMode(bool enabled, void* hdrMetadata)
 {
+    // Renderers retrieve this same snapshot through LiGetHdrMetadata(). Keep
+    // accepting the callback argument so our listener ABI matches common-c.
+    Q_UNUSED(hdrMetadata);
+
     // If we're in the process of recreating our decoder when we get
     // this callback, we'll drop it. The main thread will make the
     // callback when it finishes creating the new decoder.
@@ -345,12 +781,108 @@ void Session::clSetHdrMode(bool enabled)
 void Session::clClipboardData(const char* data, int length)
 {
     Session* session = s_ActiveSession;
-    if (session == nullptr || session->m_ClipboardSync == nullptr) {
+    if (session == nullptr) {
         return;
     }
 
-    // Marshals to GUI thread internally; safe to call from the recv thread.
-    session->m_ClipboardSync->handleIncomingFrame(data, length);
+    std::lock_guard<std::mutex> lock(session->m_ClipboardHelperMutex);
+    if (session->m_ClipboardHelper == nullptr) {
+        return;
+    }
+
+    // Queues internally; safe to call from the recv thread.
+    session->m_ClipboardHelper->handleIncomingFrame(data, length);
+}
+
+void Session::stopClipboardHelper()
+{
+    ClipboardHelperClient* helper;
+    {
+        // Detach only after any in-flight receive callback has returned.
+        // Do not hold the lock while waiting for the helper process to exit.
+        std::lock_guard<std::mutex> lock(m_ClipboardHelperMutex);
+        helper = m_ClipboardHelper;
+        m_ClipboardHelper = nullptr;
+    }
+    delete helper;
+}
+
+void Session::clCursorUpdate(const LI_CURSOR_UPDATE* update)
+{
+    Session* session = s_ActiveSession;
+    if (session == nullptr || update == nullptr) {
+        return;
+    }
+
+    auto pending = std::make_shared<RemoteCursorUpdate>();
+    pending->hasShape = (update->flags & LI_CURSOR_UPDATE_FLAG_SHAPE) != 0;
+    pending->visible = (update->flags & LI_CURSOR_UPDATE_FLAG_VISIBLE) != 0;
+    pending->shapeId = update->shapeId;
+    pending->width = update->width;
+    pending->height = update->height;
+    pending->hotspotX = update->hotspotX;
+    pending->hotspotY = update->hotspotY;
+    if (pending->hasShape && update->pixels != nullptr && update->pixelDataLength != 0) {
+        pending->bgra = QByteArray(
+            reinterpret_cast<const char*>(update->pixels),
+            static_cast<int>(update->pixelDataLength));
+    }
+
+    bool queueCursorEvent = false;
+    {
+        std::lock_guard<std::mutex> lock(session->m_CursorUpdateMutex);
+        session->m_PendingCursorUpdate = pending;
+        if (!session->m_CursorUpdateEventQueued) {
+            session->m_CursorUpdateEventQueued = true;
+            queueCursorEvent = true;
+        }
+    }
+
+    if (!queueCursorEvent) {
+        return;
+    }
+
+    SDL_Event cursorEvent = {};
+    cursorEvent.type = SDL_USEREVENT;
+    cursorEvent.user.code = SDL_CODE_CURSOR_UPDATE;
+    if (SDL_PushEvent(&cursorEvent) <= 0) {
+        std::lock_guard<std::mutex> lock(session->m_CursorUpdateMutex);
+        // Keep the latest mailbox value. A subsequent callback will enqueue
+        // another wakeup after observing the cleared flag.
+        session->m_CursorUpdateEventQueued = false;
+    }
+}
+
+void Session::clDs5HapticsPcm(const LI_DS5_HAPTICS_PCM_FRAME* frame)
+{
+    Session* session = s_ActiveSession;
+    if (session != nullptr && session->m_DualSenseHapticsRenderer != nullptr && frame != nullptr) {
+        // submit() copies into a bounded queue before this receive callback returns.
+        session->m_DualSenseHapticsRenderer->submit(*frame);
+    }
+}
+
+void Session::clDs5HapticsIrV2(const LI_DS5_HAPTICS_IR_FRAME_V2* frame)
+{
+    if (frame == nullptr) {
+        return;
+    }
+
+    Session* session = s_ActiveSession;
+    bool startedNative = false;
+    if (session != nullptr && session->m_DualSenseHapticsRenderer != nullptr &&
+        session->m_DualSenseHapticsRenderer->submit(*frame, startedNative)) {
+        if (startedNative) {
+            clRumble(frame->controllerNumber, 0, 0);
+        }
+        return;
+    }
+
+    // IR lanes preserve authored left/right intent, while SDL exposes the
+    // common low/high-frequency motor model. Fold both lanes into spectral
+    // energy here; device-specific renderers can replace this calibration.
+    const auto output = dualsense_haptics::renderIrV2(*frame);
+    clRumble(frame->controllerNumber, output.lowFrequency, output.highFrequency);
 }
 
 void Session::clRumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger, uint16_t rightTrigger)
@@ -363,7 +895,7 @@ void Session::clRumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger, 
     rumbleEvent.user.code = SDL_CODE_GAMECONTROLLER_RUMBLE_TRIGGERS;
     rumbleEvent.user.data1 = (void*)(uintptr_t)controllerNumber;
     rumbleEvent.user.data2 = (void*)(uintptr_t)((leftTrigger << 16) | rightTrigger);
-    SDL_PushEvent(&rumbleEvent);
+    pushEventOrWarn(rumbleEvent);
 }
 
 void Session::clSetMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz)
@@ -376,7 +908,7 @@ void Session::clSetMotionEventState(uint16_t controllerNumber, uint8_t motionTyp
     setMotionEventStateEvent.user.code = SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE;
     setMotionEventStateEvent.user.data1 = (void*)(uintptr_t)controllerNumber;
     setMotionEventStateEvent.user.data2 = (void*)(uintptr_t)((motionType << 16) | reportRateHz);
-    SDL_PushEvent(&setMotionEventStateEvent);
+    pushEventOrWarn(setMotionEventStateEvent);
 }
 
 void Session::clSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b)
@@ -389,7 +921,7 @@ void Session::clSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g
     setControllerLEDEvent.user.code = SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED;
     setControllerLEDEvent.user.data1 = (void*)(uintptr_t)controllerNumber;
     setControllerLEDEvent.user.data2 = (void*)(uintptr_t)(r << 16 | g << 8 | b);
-    SDL_PushEvent(&setControllerLEDEvent);
+    pushEventOrWarn(setControllerLEDEvent);
 }
 
 void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlags, uint8_t typeLeft, uint8_t typeRight, uint8_t *left, uint8_t *right){
@@ -404,6 +936,11 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     // Based on the following SDL code:
     // https://github.com/libsdl-org/SDL/blob/120c76c84bbce4c1bfed4e9eb74e10678bd83120/test/testgamecontroller.c#L286-L307
     DualSenseOutputReport *state = (DualSenseOutputReport *) SDL_malloc(sizeof(DualSenseOutputReport));
+    if (state == nullptr) {
+        SDL_LogError(SDL_LOG_CATEGORY_INPUT,
+                     "Unable to allocate DualSense adaptive trigger report");
+        return;
+    }
     SDL_zero(*state);
     state->validFlag0 = (eventFlags & DS_EFFECT_RIGHT_TRIGGER) | (eventFlags & DS_EFFECT_LEFT_TRIGGER);
     state->rightTriggerEffectType = typeRight;
@@ -412,11 +949,17 @@ void Session::clSetAdaptiveTriggers(uint16_t controllerNumber, uint8_t eventFlag
     SDL_memcpy(state->leftTriggerEffect, left, sizeof(state->leftTriggerEffect));
 
     setControllerLEDEvent.user.data2 = (void *) state;
-    SDL_PushEvent(&setControllerLEDEvent);
+    if (SDL_PushEvent(&setControllerLEDEvent) <= 0) {
+        SDL_LogError(SDL_LOG_CATEGORY_INPUT,
+                     "Unable to queue DualSense adaptive trigger effect: %s",
+                     SDL_GetError());
+        SDL_free(state);
+    }
 }
 
 
 bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
+                            StreamingPreferences::RendererSelection renderer,
                             SDL_Window* window, int videoFormat, int width, int height,
                             int frameRate, bool enableVsync, bool enableFramePacing, bool enableVideoEnhancement, bool ignoreAspectRatio, bool testOnly, IVideoDecoder*& chosenDecoder)
 {
@@ -434,10 +977,14 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     params.window = window;
     params.enableVsync = enableVsync;
     params.enableFramePacing = enableFramePacing;
-    params.enableVideoEnhancement = enableVideoEnhancement;
+    // Preserve the saved preference while making the effective decoder state
+    // match the UI: video enhancement is unavailable with software decoding.
+    params.enableVideoEnhancement = enableVideoEnhancement &&
+                                    vds != StreamingPreferences::VDS_FORCE_SOFTWARE;
     params.ignoreAspectRatio = ignoreAspectRatio;
     params.testOnly = testOnly;
     params.vds = vds;
+    params.renderer = renderer;
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
@@ -500,6 +1047,8 @@ int Session::drSetup(int videoFormat, int width, int height, int frameRate, void
 
 int Session::drSubmitDecodeUnit(PDECODE_UNIT du)
 {
+    s_ActiveSession->m_HasReceivedVideo = true;
+
     // Use a lock since we'll be yanking this decoder out
     // from underneath the session when we initiate destruction.
     // We need to destroy the decoder on the main thread to satisfy
@@ -539,6 +1088,7 @@ void Session::getDecoderInfo(SDL_Window* window,
 
     // Try an HEVC Main10 decoder first to see if we have HDR support
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
+                      StreamingPreferences::RS_PROBE_ONLY,
                       window, VIDEO_FORMAT_H265_MAIN10, 1920, 1080, 60,
                       false, false, false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
@@ -552,6 +1102,7 @@ void Session::getDecoderInfo(SDL_Window* window,
 
     // Try an AV1 Main10 decoder next to see if we have HDR support
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
+                      StreamingPreferences::RS_PROBE_ONLY,
                       window, VIDEO_FORMAT_AV1_MAIN10, 1920, 1080, 60,
                       false, false, false, false, true, decoder)) {
         // If we've got a working AV1 Main 10-bit decoder, we'll enable the HDR checkbox
@@ -564,9 +1115,11 @@ void Session::getDecoderInfo(SDL_Window* window,
         // If we found no hardware decoders with HDR, check for a renderer
         // that supports HDR rendering with software decoded frames.
         if (chooseDecoder(StreamingPreferences::VDS_FORCE_SOFTWARE,
+                          StreamingPreferences::RS_PROBE_ONLY,
                           window, VIDEO_FORMAT_H265_MAIN10, 1920, 1080, 60,
                           false, false, false, false, true, decoder) ||
             chooseDecoder(StreamingPreferences::VDS_FORCE_SOFTWARE,
+                          StreamingPreferences::RS_PROBE_ONLY,
                           window, VIDEO_FORMAT_AV1_MAIN10, 1920, 1080, 60,
                           false, false, false, false, true, decoder)) {
             isHdrSupported = decoder->isHdrSupported();
@@ -581,6 +1134,7 @@ void Session::getDecoderInfo(SDL_Window* window,
 
     // Try a regular hardware accelerated HEVC decoder now
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
+                      StreamingPreferences::RS_PROBE_ONLY,
                       window, VIDEO_FORMAT_H265, 1920, 1080, 60,
                       false, false, false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
@@ -594,6 +1148,7 @@ void Session::getDecoderInfo(SDL_Window* window,
 
 #if 0 // See AV1 comment at the top of this function
     if (chooseDecoder(StreamingPreferences::VDS_FORCE_HARDWARE,
+                      StreamingPreferences::RS_PROBE_ONLY,
                       window, VIDEO_FORMAT_AV1_MAIN8, 1920, 1080, 60,
                       false, false, false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
@@ -608,6 +1163,7 @@ void Session::getDecoderInfo(SDL_Window* window,
     // If we still didn't find a hardware decoder, try H.264 now.
     // This will fall back to software decoding, so it should always work.
     if (chooseDecoder(StreamingPreferences::VDS_AUTO,
+                      StreamingPreferences::RS_PROBE_ONLY,
                       window, VIDEO_FORMAT_H264, 1920, 1080, 60,
                       false, false, false, false, true, decoder)) {
         isHardwareAccelerated = decoder->isHardwareAccelerated();
@@ -629,7 +1185,10 @@ Session::getDecoderAvailability(SDL_Window* window,
 {
     IVideoDecoder* decoder;
 
-    if (!chooseDecoder(vds, window, videoFormat, width, height, frameRate, false, false, false, false, true, decoder)) {
+    if (!chooseDecoder(vds,
+                       StreamingPreferences::RS_PROBE_ONLY,
+                       window, videoFormat, width, height, frameRate,
+                       false, false, false, false, true, decoder)) {
         return DecoderAvailability::None;
     }
 
@@ -644,7 +1203,12 @@ bool Session::populateDecoderProperties(SDL_Window* window)
 {
     IVideoDecoder* decoder;
 
+    // NB: We pass the real renderer selection rather than RS_PROBE_ONLY
+    // here because this is operating on the real streaming window, and
+    // instantiating Metal or AVSBDL renderers can interfere with MoltenVK's
+    // attempt to change the window's colorspace, causing washed out colors.
     if (!chooseDecoder(m_Preferences->videoDecoderSelection,
+                       m_Preferences->rendererSelection,
                        window,
                        m_SupportedVideoFormats.first(),
                        m_StreamConfig.width,
@@ -690,11 +1254,17 @@ bool Session::populateDecoderProperties(SDL_Window* window)
     return true;
 }
 
-Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences)
+Session::Session(NvComputer* computer,
+                 NvApp& app,
+                 StreamingPreferences *preferences,
+                 QString launchDisplayName,
+                 std::optional<bool> launchUseVdd)
     : m_Preferences(preferences ? preferences : StreamingPreferences::get()),
       m_IsFullScreen(m_Preferences->windowMode != StreamingPreferences::WM_WINDOWED || !WMUtils::isRunningDesktopEnvironment()),
       m_Computer(computer),
       m_App(app),
+      m_LaunchDisplayName(std::move(launchDisplayName)),
+      m_LaunchUseVdd(launchUseVdd),
       m_Window(nullptr),
       m_VideoDecoder(nullptr),
       m_DecoderLock(SDL_CreateMutex()),
@@ -707,26 +1277,41 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_ShouldExit(false),
       m_ConnectionInterrupted(false),
       m_SuppressConnectionErrorDialog(false),
+      m_HasReceivedVideo(false),
       m_LastTerminationErrorCode(0),
       m_AsyncConnectionSuccess(false),
+      m_LastClientSdrWhiteNits(0.0f),
       m_PortTestResults(0),
       m_OpusDecoder(nullptr),
       m_AudioRenderer(nullptr),
+      m_DualSenseHapticsRenderer(nullptr),
       m_AudioSampleCount(0),
       m_DropAudioEndTime(0),
       m_MenuPanel(nullptr),
       m_DeferCaptureRestore(false),
       m_PendingMicToggle(false),
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+      m_StylusReplayTest(nullptr),
+      m_WasCapturedBeforeStylusReplayPanel(false),
+#endif
             m_SunshineAbrEnabled(false),
             m_LastAbrFeedbackTicks(0),
             m_AbrFeedbackInFlight(std::make_shared<std::atomic_bool>(false)),
             m_AbrCurrentBitrateKbps(std::make_shared<std::atomic_int>(0)),
       m_Toast(nullptr),
+      m_FileMappingState(OverlayMenuPanel::FileMappingState::Unknown),
+      m_FileMappingDetail(tr("Checking")),
+      m_FileMappingToast(),
+      m_FileMappingToastPending(false),
+      m_FileMappingProbeState(nullptr),
+      m_FileMappingMountState(nullptr),
+      m_FileMappingMountPath(),
+      m_FileMappingSessionId(QUuid::createUuid().toString(QUuid::WithoutBraces)),
       m_MenuCloseTicks(0),
       m_MicStream(nullptr)
 {
     memset(&m_LastAbrVideoStats, 0, sizeof(m_LastAbrVideoStats));
-    m_ClipboardSync = nullptr;
+    m_ClipboardHelper = nullptr;
 }
 
 Session::~Session()
@@ -734,18 +1319,323 @@ Session::~Session()
     // NB: This may not get destroyed for a long time! Don't put any non-trivial cleanup here.
     // Use Session::exec() or DeferredSessionCleanupTask instead.
 
-    if (m_ClipboardSync != nullptr) {
-        m_ClipboardSync->stop();
-        delete m_ClipboardSync;
-        m_ClipboardSync = nullptr;
+    if (m_ClipboardHelper != nullptr) {
+        stopClipboardHelper();
     }
 
+    if (m_UsbTunnel != nullptr) {
+        m_UsbTunnel->disconnect(this);
+        m_UsbTunnel->stop();
+        delete m_UsbTunnel;
+        m_UsbTunnel = nullptr;
+    }
+
+    if (m_UsbLocalServer != nullptr) {
+        m_UsbLocalServer->stop();
+        delete m_UsbLocalServer;
+        m_UsbLocalServer = nullptr;
+    }
+
+    delete m_DualSenseHapticsRenderer;
+    m_DualSenseHapticsRenderer = nullptr;
+
     SDL_DestroyMutex(m_DecoderLock);
+}
+
+void Session::updateRemoteUsbMenuState()
+{
+    if (m_MenuPanel == nullptr) {
+        return;
+    }
+
+    m_MenuPanel->updateRemoteUsbState(
+        m_Preferences->usbForwardingEnabled, m_RemoteUsbState,
+        m_RemoteUsbDevices, m_RemoteUsbActiveDeviceId, m_RemoteUsbDetail);
+}
+
+void Session::refreshRemoteUsbDevices()
+{
+    m_RemoteUsbDevices.clear();
+
+    if (m_Preferences->usbForwardingEnabled) {
+        /* Only shared (bound) devices can be forwarded, so the overlay lists
+         * exactly those. Binding itself is a desktop-side, elevated action. */
+        const QVariantList shared = UsbForwardingBackend::get()->devices();
+        for (const QVariant& entry : shared) {
+            const QVariantMap device = entry.toMap();
+            if (!device.value(QStringLiteral("isBound")).toBool() ||
+                !device.value(QStringLiteral("isConnected")).toBool()) {
+                continue;
+            }
+            // Linux：共享后端口上被换成另一台设备（busid 相同、身份不符）
+            // 时禁止转发，避免张冠李戴；isReplaced 仅 Linux 后端产生。
+            if (device.value(QStringLiteral("isReplaced")).toBool()) {
+                continue;
+            }
+            OverlayMenuPanel::RemoteUsbDevice menuDevice;
+            menuDevice.id = device.value(QStringLiteral("busId")).toString();
+            if (menuDevice.id.isEmpty()) {
+                continue;
+            }
+            menuDevice.label = device.value(QStringLiteral("description")).toString();
+            if (menuDevice.label.isEmpty()) {
+                menuDevice.label = tr("USB device");
+            }
+            menuDevice.detail = device.value(QStringLiteral("vidPid")).toString().toUpper();
+            menuDevice.supported = device.value(QStringLiteral("isSupported")).toBool();
+            m_RemoteUsbDevices.push_back(std::move(menuDevice));
+        }
+    }
+
+    if (m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Open &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Opening &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Stopping) {
+        if (!m_Preferences->usbForwardingEnabled) {
+            m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Unavailable;
+            m_RemoteUsbDetail = tr("Unavailable");
+        } else if (m_RemoteUsbDevices.empty()) {
+            m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Available;
+            m_RemoteUsbDetail = tr("No shared devices");
+        } else {
+            m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Available;
+            m_RemoteUsbDetail = tr("%1 available").arg(m_RemoteUsbDevices.size());
+        }
+    }
+
+    updateRemoteUsbMenuState();
+}
+
+void Session::enumerateRemoteUsb()
+{
+    if (!m_Preferences->usbForwardingEnabled) {
+        refreshRemoteUsbDevices();
+        return;
+    }
+    // Refreshing the list must not hide the active operation or its Stop action.
+    if (m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Open &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Opening &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Stopping) {
+        m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Discovering;
+        m_RemoteUsbDetail = tr("Scanning");
+    }
+    updateRemoteUsbMenuState();
+
+    UsbForwardingBackend* backend = UsbForwardingBackend::get();
+    /* devicesChanged is emitted on the Qt thread once the probe finishes. */
+    connect(backend, &UsbForwardingBackend::devicesChanged,
+            this, &Session::refreshRemoteUsbDevices,
+            static_cast<Qt::ConnectionType>(Qt::QueuedConnection |
+                                            Qt::UniqueConnection));
+    backend->refresh();
+}
+
+void Session::startRemoteUsb(const QString &deviceId)
+{
+    if (!m_Preferences->usbForwardingEnabled || deviceId.isEmpty()) {
+        return;
+    }
+    if (m_UsbTunnel != nullptr || m_UsbCapabilityPending) {
+        showStreamingToast(tr("Another USB device is already being forwarded."),
+                           3000);
+        return;
+    }
+
+    bool supported = false;
+    for (const auto& device : m_RemoteUsbDevices) {
+        if (device.id == deviceId) {
+            supported = device.supported;
+            break;
+        }
+    }
+    if (!supported) {
+        showStreamingToast(tr("This USB device cannot be forwarded."), 3000);
+        return;
+    }
+
+    UsbForwarding::TunnelConfig config;
+    config.busId = deviceId.toUtf8();
+
+    IdentityManager* identity = IdentityManager::get();
+    if (identity == nullptr || m_Computer == nullptr) {
+        showStreamingToast(tr("USB forwarding is unavailable for this host."),
+                           3000);
+        return;
+    }
+    NvAddress address;
+    uint16_t httpsPort;
+    QString uuid;
+    {
+        QReadLocker locker(&m_Computer->lock);
+        address = m_Computer->activeAddress;
+        httpsPort = m_Computer->activeHttpsPort;
+        uuid = m_Computer->uuid;
+        config.host = m_Computer->activeAddress.address();
+        config.pinnedServerCertificate = m_Computer->serverCert;
+    }
+    config.sslConfiguration = identity->getSslConfig();
+
+    m_RemoteUsbActiveDeviceId = deviceId;
+    m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Opening;
+    m_RemoteUsbDetail = tr("Checking host USB forwarding support");
+    m_UsbCapabilityPending = true;
+    const auto generation = ++m_UsbCapabilityGeneration;
+    updateRemoteUsbMenuState();
+
+    struct Result {
+        std::optional<UsbForwarding::Capability> capability;
+        bool hostUpdateRequired = false;
+        QString localError;
+    };
+    auto result = std::make_shared<Result>();
+    // Capture a connection snapshot, never Session or NvComputer, on the worker.
+    auto worker = QThread::create([result, address, httpsPort, uuid,
+                                  certificate = config.pinnedServerCertificate] {
+        result->localError = UsbForwardingEnvironment::readinessError(
+            UsbForwardingEnvironment::probeServices());
+        if (!result->localError.isEmpty()) return;
+        try {
+            NvHTTP http(address, httpsPort, certificate, true, nullptr, uuid);
+            result->capability = http.getUsbForwardingCapability();
+        } catch (const QtNetworkReplyException& error) {
+            result->hostUpdateRequired = error.getError() == QNetworkReply::ContentNotFoundError;
+        } catch (const std::exception&) {
+            // Never surface/log a response body that could contain credentials.
+        }
+    });
+    connect(worker, &QThread::finished, this,
+            [this, result, generation, config = std::move(config)]() mutable {
+        if (generation != m_UsbCapabilityGeneration) return;
+        m_UsbCapabilityPending = false;
+        if (!m_Preferences->usbForwardingEnabled) {
+            teardownUsbTunnel();
+            return;
+        }
+        if (!result->localError.isEmpty() || !result->capability || !result->capability->available) {
+            const QString message = !result->localError.isEmpty() ? result->localError : result->hostUpdateRequired
+                ? tr("Update Sunshine to use automatic USB forwarding setup.")
+                : !result->capability ? tr("Could not check host USB forwarding. Try again.")
+                : result->capability->reason == QStringLiteral("disabled")
+                    ? tr("Enable USB forwarding in Sunshine settings and restart the host.")
+                    : tr("Host USB forwarding is unavailable. Check its driver and settings.");
+            teardownUsbTunnel();
+            m_RemoteUsbDetail = message;
+            updateRemoteUsbMenuState();
+            showStreamingToast(message, 5000);
+            return;
+        }
+        config.port = result->capability->port;
+        config.sessionToken = result->capability->token;
+        startConfiguredRemoteUsb(std::move(config));
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
+}
+
+void Session::startConfiguredRemoteUsb(UsbForwarding::TunnelConfig config)
+{
+#ifdef Q_OS_DARWIN
+    /* macOS has no resident USB/IP service: spawn the bundled moonlight-usbd
+     * for this device and point the tunnel at its ephemeral loopback port.
+     * Spawned on the Session thread with blocking waits (like the clipboard
+     * helper), never on the capability worker above. */
+    m_UsbLocalServer = new UsbForwardingLocalServer();
+    quint16 helperPort = 0;
+    QString helperError;
+    if (!m_UsbLocalServer->start({QString::fromUtf8(config.busId)},
+                                 &helperPort, &helperError)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "USB helper failed to start: %s",
+                    helperError.toUtf8().constData());
+        const QString message = helperError.contains(QLatin1String("device_occupied"))
+                ? tr("This USB device is in use by macOS and cannot be forwarded.")
+                : helperError.contains(QLatin1String("device_not_found"))
+                      ? tr("The USB device was unplugged. Refresh the list and try again.")
+                      : tr("Could not start the local USB sharing service.");
+        delete m_UsbLocalServer;
+        m_UsbLocalServer = nullptr;
+        teardownUsbTunnel();
+        m_RemoteUsbDetail = message;
+        updateRemoteUsbMenuState();
+        showStreamingToast(message, 5000);
+        return;
+    }
+    config.localHost = QStringLiteral("127.0.0.1");
+    config.localPort = helperPort;
+#endif
+
+    m_RemoteUsbDetail = tr("Connecting");
+    updateRemoteUsbMenuState();
+    m_UsbTunnel = new UsbForwarding::Tunnel(std::move(config), this);
+    connect(m_UsbTunnel, &UsbForwarding::Tunnel::forwarding, this, [this] {
+        m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Open;
+        m_RemoteUsbDetail = tr("Connected");
+        updateRemoteUsbMenuState();
+        showStreamingToast(tr("USB tunnel connected. Check device availability on the host."), 4000);
+    });
+    connect(m_UsbTunnel, &UsbForwarding::Tunnel::finished,
+            this, [this](const QString& message) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "USB tunnel finished: %s",
+                    message.toUtf8().constData());
+        if (!message.isEmpty()) {
+            showStreamingToast(message, 4000);
+        }
+        teardownUsbTunnel();
+    });
+
+    QString startError;
+    if (!m_UsbTunnel->start(&startError)) {
+        showStreamingToast(startError, 4000);
+        teardownUsbTunnel();
+    }
+}
+
+void Session::stopRemoteUsb()
+{
+    if (m_UsbTunnel == nullptr && !m_UsbCapabilityPending) {
+        return;
+    }
+    m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Stopping;
+    m_RemoteUsbDetail = tr("Releasing");
+    updateRemoteUsbMenuState();
+    teardownUsbTunnel();
+}
+
+void Session::teardownUsbTunnel()
+{
+    ++m_UsbCapabilityGeneration;
+    m_UsbCapabilityPending = false;
+    if (m_UsbTunnel != nullptr) {
+        m_UsbTunnel->disconnect(this);
+        m_UsbTunnel->stop();
+        m_UsbTunnel->deleteLater();
+        m_UsbTunnel = nullptr;
+    }
+    if (m_UsbLocalServer != nullptr) {
+        m_UsbLocalServer->stop();
+        delete m_UsbLocalServer;
+        m_UsbLocalServer = nullptr;
+    }
+    m_RemoteUsbActiveDeviceId.clear();
+    m_RemoteUsbState = OverlayMenuPanel::RemoteUsbState::Available;
+    refreshRemoteUsbDevices();
 }
 
 bool Session::initialize(QQuickWindow* qtWindow)
 {
     m_QtWindow = qtWindow;
+#ifdef Q_OS_WIN32
+    // Capture this on the Qt thread. The launch request is assembled later on
+    // a worker thread, where reading QWindow/QScreen state would be unsafe.
+    if (m_QtWindow != nullptr && m_QtWindow->screen() != nullptr) {
+        m_ClientDisplayName = m_QtWindow->screen()->name();
+    }
+#endif
+
+    // SDL reads this hint when the video subsystem initializes. Configure it for
+    // each session so preference changes take effect on the next stream without
+    // restarting Moonlight. This hint makes sens only on macOS currently.
+    bool nativeTouchpadEnabled = m_Preferences->enableNativeTouchpad;
+    SDL_SetHint(SDL_HINT_TRACKPAD_IS_TOUCH_ONLY, nativeTouchpadEnabled ? "1" : "0");
 
 #ifdef Q_OS_DARWIN
     if (qEnvironmentVariableIntValue("I_WANT_BUGGY_FULLSCREEN") == 0) {
@@ -1457,7 +2347,13 @@ private:
 
         // Finish cleanup of the connection state
         QMetaObject::invokeMethod(m_Session, &Session::stopMicrophone, Qt::BlockingQueuedConnection);
+        if (m_Session->m_DualSenseHapticsRenderer != nullptr) {
+            m_Session->m_DualSenseHapticsRenderer->setControllerTarget(-1);
+        }
         LiStopConnection();
+        stopControllerRumbleAtConnectionBoundary(nullptr);
+        delete m_Session->m_DualSenseHapticsRenderer;
+        m_Session->m_DualSenseHapticsRenderer = nullptr;
 
         // Perform a best-effort app quit
         if (shouldQuit) {
@@ -1499,17 +2395,39 @@ void Session::getWindowDimensions(int& x, int& y,
         if (m_QtWindow != nullptr) {
             QScreen* screen = m_QtWindow->screen();
             if (screen != nullptr) {
+#ifdef Q_OS_WIN32
+                QRect displayRect;
+                const bool hasNativeDisplayRect =
+                        qtWindowNativeMonitorBounds(m_QtWindow, displayRect);
+                if (!hasNativeDisplayRect) {
+                    displayRect = screen->geometry();
+                }
+#else
                 QRect displayRect = screen->geometry();
+#endif
 
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "Qt UI screen is at (%d,%d)",
-                            displayRect.x(), displayRect.y());
+                            "Qt UI screen is at (%d,%d) %dx%d",
+                            displayRect.x(), displayRect.y(),
+                            displayRect.width(), displayRect.height());
                 for (int i = 0; i < SDL_GetNumVideoDisplays(); i++) {
                     SDL_Rect displayBounds;
 
                     if (SDL_GetDisplayBounds(i, &displayBounds) == 0) {
-                        if (displayBounds.x == displayRect.x() &&
-                            displayBounds.y == displayRect.y()) {
+#ifdef Q_OS_WIN32
+                        const bool matchesDisplay = hasNativeDisplayRect
+                                ? (displayBounds.x == displayRect.x() &&
+                                   displayBounds.y == displayRect.y() &&
+                                   displayBounds.w == displayRect.width() &&
+                                   displayBounds.h == displayRect.height())
+                                : (displayBounds.x == displayRect.x() &&
+                                   displayBounds.y == displayRect.y());
+#else
+                        const bool matchesDisplay =
+                                displayBounds.x == displayRect.x() &&
+                                displayBounds.y == displayRect.y();
+#endif
+                        if (matchesDisplay) {
                             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                         "SDL found matching display %d",
                                         i);
@@ -1713,61 +2631,97 @@ void Session::toggleFullscreen()
 
 // ---- Qt-based overlay menu methods ----
 
-void Session::showQtOverlayMenu()
+void Session::showQtOverlayMenu(std::optional<QPoint> pointerGlobalPosition,
+                                bool closeWhenPointerOutside)
 {
     if (!m_MenuPanel || m_MenuPanel->isMenuVisible() || m_MenuPanel->isClosing()) return;
+    if (!isStreamingWindowVisible()) return;
 
     // Check if overlay menu is disabled before releasing mouse capture
     if (m_Preferences->overlayMenuPosition == StreamingPreferences::OMP_DISABLED) {
         return; // Do not show
     }
 
+    const QRect parentRect = qtOverlayGeometryForSdlWindow(m_Window);
+    if (!parentRect.isValid()) {
+        return;
+    }
+
     // Save capture state and release mouse
     m_WasCapturedBeforeMenu = m_InputHandler->isCaptureActive();
     if (m_WasCapturedBeforeMenu) {
-        SDL_SetRelativeMouseMode(SDL_FALSE);
-        SDL_ShowCursor(SDL_ENABLE);
+        m_InputHandler->setCaptureActive(false);
     }
 
     // Flush stale mouse motion events from relative mode
     SDL_FlushEvent(SDL_MOUSEMOTION);
 
-    // Get SDL window position and size in screen coordinates
-    int wx, wy, ww, wh;
-    SDL_GetWindowPosition(m_Window, &wx, &wy);
-    SDL_GetWindowSize(m_Window, &ww, &wh);
+    // Rebuild for the current gamepad set before applying dynamic menu state.
+    GamepadUiStyle gamepadUiStyle = m_InputHandler->getGamepadUiStyle();
+    m_MenuPanel->setGamepadHints(
+        m_InputHandler->hasConnectedGamepads(), gamepadUiStyle, m_Preferences->swapFaceButtons,
+        m_InputHandler->getGamepadQuitEnabled()
+            ? gamepadQuitComboGlyphText(gamepadUiStyle, m_InputHandler->getGamepadQuitCombo(),
+                                        m_Preferences->swapFaceButtons)
+            : QString());
+
+    if (m_Preferences->usbForwardingEnabled &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Opening &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Open &&
+        m_RemoteUsbState != OverlayMenuPanel::RemoteUsbState::Stopping) {
+        enumerateRemoteUsb();
+    }
 
     // Update dynamic state before showing
     m_MenuPanel->updateMicrophoneState(m_MicStream != nullptr);
     m_MenuPanel->updateBitrateState(m_Preferences->bitrateKbps);
-    m_MenuPanel->setHasGamepads(m_InputHandler->getAttachedGamepadMask() != 0);
     m_MenuPanel->updateGamepadMouseState(m_InputHandler->isMouseEmulationActive());
+    m_MenuPanel->updateMenuPositionState(
+            menuPlacementActionForPreference(m_Preferences->overlayMenuPosition));
+    updateFileMappingMenuState();
+    updateRemoteUsbMenuState();
 
     // Show menu based on user preference
     switch (m_Preferences->overlayMenuPosition) {
     case StreamingPreferences::OMP_LEFT_EDGE:
-        m_MenuPanel->showAtLeftEdge(wx, wy, ww, wh);
+        m_MenuPanel->showAtLeftEdge(parentRect.x(), parentRect.y(),
+                                    parentRect.width(), parentRect.height(),
+                                    pointerGlobalPosition,
+                                    closeWhenPointerOutside);
+        break;
+    case StreamingPreferences::OMP_TOP_EDGE:
+        m_MenuPanel->showAtTopEdge(parentRect.x(), parentRect.y(),
+                                   parentRect.width(), parentRect.height(),
+                                   pointerGlobalPosition,
+                                   closeWhenPointerOutside);
         break;
     case StreamingPreferences::OMP_BUTTON:
-        // Show menu at the button's position (top-right corner)
-        m_MenuPanel->showAtCursor(wx, wy, ww, wh,
-                                  wx + ww - 40, wy + 40);
+    {
+        // Open next to the current button position, including after the user drags it.
+        const QPoint menuPosition = pointerGlobalPosition.value_or(
+                m_MenuButton ? m_MenuButton->geometry().center() : QCursor::pos());
+        m_MenuPanel->showAtCursor(parentRect.x(), parentRect.y(),
+                                  parentRect.width(), parentRect.height(),
+                                  menuPosition,
+                                  closeWhenPointerOutside && pointerGlobalPosition.has_value());
         // Hide button while menu is visible
         if (m_MenuButton) {
             m_MenuButton->hideButton();
         }
         break;
+    }
     case StreamingPreferences::OMP_RIGHT_EDGE:
     default:
-        m_MenuPanel->showAtRightEdge(wx, wy, ww, wh);
+        m_MenuPanel->showAtRightEdge(parentRect.x(), parentRect.y(),
+                                     parentRect.width(), parentRect.height(),
+                                     pointerGlobalPosition,
+                                     closeWhenPointerOutside);
         break;
     }
 
-    // Pump Qt events immediately to trigger first paint
-    QCoreApplication::processEvents(QEventLoop::AllEvents);
-
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "Qt overlay menu shown at (%d,%d) %dx%d", wx, wy, ww, wh);
+                "Qt overlay menu shown at (%d,%d) %dx%d",
+                parentRect.x(), parentRect.y(), parentRect.width(), parentRect.height());
 }
 
 void Session::hideQtOverlayMenu()
@@ -1788,8 +2742,63 @@ void Session::toggleQtOverlayMenu()
     }
 }
 
+bool Session::isStreamingWindowVisible() const
+{
+    if (m_Window == nullptr) {
+        return false;
+    }
+
+    Uint32 windowFlags = SDL_GetWindowFlags(m_Window);
+    return (windowFlags & SDL_WINDOW_SHOWN) &&
+           !(windowFlags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+}
+
+void Session::syncQtOverlayWindowsWithSdlWindowState()
+{
+    if (!isStreamingWindowVisible()) {
+        if (m_MenuPanel && m_MenuPanel->isMenuVisible()) {
+            m_MenuPanel->closeMenu();
+        }
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+        if (m_StylusReplayTest) {
+            // This also cancels a deferred request that has not become visible yet.
+            m_StylusReplayTest->closePanel();
+        }
+#endif
+        if (m_MenuButton) {
+            m_MenuButton->hideButton();
+        }
+        if (m_Toast) {
+            m_Toast->dismissImmediately();
+        }
+        return;
+    }
+
+    if (!m_MenuButton) {
+        return;
+    }
+
+    if (m_Preferences->overlayMenuPosition != StreamingPreferences::OMP_BUTTON ||
+        (m_MenuPanel && (m_MenuPanel->isMenuVisible() || m_MenuPanel->isClosing()))) {
+        m_MenuButton->hideButton();
+        return;
+    }
+
+    const QRect parentRect = qtOverlayGeometryForSdlWindow(m_Window);
+    if (parentRect.isValid()) {
+        m_MenuButton->showButton(parentRect.x(), parentRect.y(),
+                                 parentRect.width(), parentRect.height());
+    }
+}
+
 void Session::dispatchQtMenuAction(OverlayMenuPanel::MenuAction action)
 {
+    if (const auto placement = menuPlacementForAction(action)) {
+        m_Preferences->setOverlayMenuPosition(*placement);
+        m_Preferences->save();
+        return;
+    }
+
     // Map OverlayMenuPanel::MenuAction to SdlInputHandler::KeyCombo
     SdlInputHandler::KeyCombo combo;
     switch (action) {
@@ -1826,6 +2835,43 @@ void Session::dispatchQtMenuAction(OverlayMenuPanel::MenuAction action)
         combo = SdlInputHandler::KeyComboTogglePointerRegionLock;
         break;
 
+    case OverlayMenuPanel::MenuAction::ShowHostFiles:
+        appendFileMappingDiagnostic(
+                QStringLiteral("overlay.click_host_files"),
+                QStringLiteral("state=%1 detail=%2 mount_path=%3")
+                        .arg(fileMappingStateName(m_FileMappingState),
+                             m_FileMappingDetail,
+                             m_FileMappingMountPath),
+                m_Computer ? m_Computer->uuid : QString(),
+                m_FileMappingSessionId);
+        if (m_FileMappingState == OverlayMenuPanel::FileMappingState::Checking ||
+            m_FileMappingState == OverlayMenuPanel::FileMappingState::Unknown) {
+            showStreamingToast(tr("Checking host file sharing..."), 2000);
+        }
+        else if (m_FileMappingState == OverlayMenuPanel::FileMappingState::Mounting) {
+            showStreamingToast(tr("Preparing host files..."), 2000);
+        }
+        else if (m_FileMappingState == OverlayMenuPanel::FileMappingState::Open &&
+                 !m_FileMappingMountPath.isEmpty()) {
+            openFileMappingMountPath();
+            showStreamingToast(tr("Opening host files..."), 2000);
+        }
+        else if (m_FileMappingState == OverlayMenuPanel::FileMappingState::Available) {
+            startFileMappingMount();
+        }
+        else if (m_FileMappingState == OverlayMenuPanel::FileMappingState::Error ||
+                 m_FileMappingState == OverlayMenuPanel::FileMappingState::Unavailable) {
+            showStreamingToast(m_FileMappingToast.isEmpty()
+                               ? tr("Host file sharing is not available. Retrying...")
+                               : m_FileMappingToast + tr(" Retrying..."),
+                               4500);
+            startFileMappingUxProbe();
+        }
+        else {
+            showStreamingToast(tr("Host file sharing is not available."), 3000);
+        }
+        return;
+
     // --- Microphone toggle ---
     // Deferred: toggle mic outside processEvents() to avoid QAudioSource heap corruption
     case OverlayMenuPanel::MenuAction::ToggleMicrophone:
@@ -1845,36 +2891,31 @@ void Session::dispatchQtMenuAction(OverlayMenuPanel::MenuAction action)
         return;
     }
 
-    // --- Bitrate presets ---
-    case OverlayMenuPanel::MenuAction::SetBitrate1000:
-    case OverlayMenuPanel::MenuAction::SetBitrate2000:
-    case OverlayMenuPanel::MenuAction::SetBitrate5000:
-    case OverlayMenuPanel::MenuAction::SetBitrate10000:
-    case OverlayMenuPanel::MenuAction::SetBitrate20000:
-    case OverlayMenuPanel::MenuAction::SetBitrate30000:
-    case OverlayMenuPanel::MenuAction::SetBitrate50000:
-    case OverlayMenuPanel::MenuAction::SetBitrate100000:
-    {
-        static const int kBitrateMap[] = {
-            1000, 2000, 5000, 10000, 20000, 30000, 50000, 100000
-        };
-        int idx = (int)action - (int)OverlayMenuPanel::MenuAction::SetBitrate1000;
-        if (idx >= 0 && idx < 8) {
-            int newBitrate = kBitrateMap[idx];
-            // Save preference for future sessions
-            m_Preferences->bitrateKbps = newBitrate;
-            m_Preferences->save();
-            // Try to change bitrate in the current session via Sunshine API
-            requestRuntimeBitrateChange(newBitrate);
-            // Show toast notification
-            if (newBitrate >= 1000) {
-                showStreamingToast(QString("Bitrate: %1 Mbps").arg(newBitrate / 1000));
-            } else {
-                showStreamingToast(QString("Bitrate: %1 Kbps").arg(newBitrate));
+    // --- Bitrate ---
+    // Adjustments from the overlay menu (scrubber row + presets) arrive via
+    // the panel's bitrate change callback; nothing to dispatch here.
+
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+    case OverlayMenuPanel::MenuAction::OpenStylusReplayPanel:
+        // Developer-only integration boundary: transfer capture ownership,
+        // then delegate all test UI and replay behavior to StylusReplayTest.
+        m_WasCapturedBeforeStylusReplayPanel =
+                m_WasCapturedBeforeStylusReplayPanel || m_WasCapturedBeforeMenu;
+        m_WasCapturedBeforeMenu = false;
+        if (m_StylusReplayTest) {
+            const QRect parentRect = qtOverlayGeometryForSdlWindow(m_Window);
+            if (parentRect.isValid()) {
+                m_StylusReplayTest->requestShow(parentRect);
+            }
+            else {
+                restoreCaptureAfterStylusReplayPanel();
             }
         }
+        else {
+            restoreCaptureAfterStylusReplayPanel();
+        }
         return;
-    }
+#endif
 
     default:
         return;
@@ -1903,15 +2944,138 @@ void Session::dispatchQtMenuAction(OverlayMenuPanel::MenuAction action)
     }
 }
 
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+void Session::restoreCaptureAfterStylusReplayPanel()
+{
+    if (!m_WasCapturedBeforeStylusReplayPanel) {
+        return;
+    }
+
+    m_WasCapturedBeforeStylusReplayPanel = false;
+    if (m_MenuPanel && (m_MenuPanel->isMenuVisible() || m_MenuPanel->isClosing())) {
+        // Let the overlay menu restore capture when it closes instead of
+        // recapturing input underneath a visible menu.
+        m_WasCapturedBeforeMenu = true;
+        return;
+    }
+
+    if (isStreamingWindowVisible()) {
+        SDL_RaiseWindow(m_Window);
+        SDL_FlushEvent(SDL_MOUSEMOTION);
+        m_InputHandler->setCaptureActive(true);
+    }
+}
+
+#endif
+
 void Session::showStreamingToast(const QString& message, int durationMs)
 {
     if (!m_Toast) return;
 
-    int wx, wy, ww, wh;
-    SDL_GetWindowPosition(m_Window, &wx, &wy);
-    SDL_GetWindowSize(m_Window, &ww, &wh);
-    m_Toast->showToast(wx, wy, ww, wh, message, durationMs);
-    QCoreApplication::processEvents();
+    const QRect parentRect = qtOverlayGeometryForSdlWindow(m_Window);
+    if (!parentRect.isValid()) {
+        return;
+    }
+    m_Toast->showToast(parentRect.x(), parentRect.y(),
+                       parentRect.width(), parentRect.height(),
+                       message, durationMs);
+}
+
+void Session::processQtOverlayEvents()
+{
+#ifdef Q_OS_DARWIN
+    if (m_MacQtEventPumpInputGuard) {
+        m_MacQtEventPumpInputGuard->beginEventProcessing();
+    }
+#endif
+    QCoreApplication::processEvents(QEventLoop::AllEvents);
+#ifdef Q_OS_DARWIN
+    if (m_MacQtEventPumpInputGuard) {
+        m_MacQtEventPumpInputGuard->finishEventProcessing();
+    }
+#endif
+}
+
+void Session::updateFileMappingMenuState()
+{
+    if (m_MenuPanel) {
+        m_MenuPanel->updateFileMappingState(m_FileMappingState, m_FileMappingDetail);
+    }
+}
+
+bool Session::openFileMappingMountPath()
+{
+    if (m_FileMappingMountPath.isEmpty()) {
+        appendFileMappingDiagnostic(
+                QStringLiteral("finder_reveal.skip"),
+                QStringLiteral("empty_mount_path"),
+                m_Computer ? m_Computer->uuid : QString(),
+                m_FileMappingSessionId);
+        return false;
+    }
+
+    const QString markerPath = QDir(m_FileMappingMountPath).filePath(QStringLiteral("README.txt"));
+    appendFileMappingDiagnostic(
+            QStringLiteral("finder_reveal.start"),
+            QStringLiteral("mount_path=%1 marker=%2 marker_exists=%3")
+                    .arg(m_FileMappingMountPath,
+                         markerPath,
+                         QFileInfo::exists(markerPath) ? QStringLiteral("true") : QStringLiteral("false")),
+            m_Computer ? m_Computer->uuid : QString(),
+            m_FileMappingSessionId);
+
+#if defined(Q_OS_MACOS)
+    if (QFileInfo::exists(markerPath) &&
+            QProcess::startDetached(QStringLiteral("/usr/bin/open"),
+                                    { QStringLiteral("-R"),
+                                      markerPath })) {
+        appendFileMappingDiagnostic(
+                QStringLiteral("finder_reveal.open_r"),
+                QStringLiteral("ok=true marker=%1").arg(markerPath),
+                m_Computer ? m_Computer->uuid : QString(),
+                m_FileMappingSessionId);
+        return true;
+    }
+    if (QProcess::startDetached(QStringLiteral("/usr/bin/open"),
+                                { m_FileMappingMountPath })) {
+        appendFileMappingDiagnostic(
+                QStringLiteral("finder_reveal.open_folder"),
+                QStringLiteral("ok=true mount_path=%1").arg(m_FileMappingMountPath),
+                m_Computer ? m_Computer->uuid : QString(),
+                m_FileMappingSessionId);
+        return true;
+    }
+#elif defined(Q_OS_WIN32) || defined(Q_OS_WIN)
+    if (QFileInfo::exists(markerPath) &&
+            QProcess::startDetached(QStringLiteral("explorer.exe"),
+                                    { QStringLiteral("/select,%1").arg(QDir::toNativeSeparators(markerPath)) })) {
+        appendFileMappingDiagnostic(
+                QStringLiteral("explorer_reveal.open_select"),
+                QStringLiteral("ok=true marker=%1").arg(markerPath),
+                m_Computer ? m_Computer->uuid : QString(),
+                m_FileMappingSessionId);
+        return true;
+    }
+    if (QProcess::startDetached(QStringLiteral("explorer.exe"),
+                                { QDir::toNativeSeparators(m_FileMappingMountPath) })) {
+        appendFileMappingDiagnostic(
+                QStringLiteral("explorer_reveal.open_folder"),
+                QStringLiteral("ok=true mount_path=%1").arg(m_FileMappingMountPath),
+                m_Computer ? m_Computer->uuid : QString(),
+                m_FileMappingSessionId);
+        return true;
+    }
+#endif
+
+    const bool opened = QDesktopServices::openUrl(QUrl::fromLocalFile(m_FileMappingMountPath));
+    appendFileMappingDiagnostic(
+            QStringLiteral("finder_reveal.desktop_services"),
+            QStringLiteral("ok=%1 mount_path=%2")
+                    .arg(opened ? QStringLiteral("true") : QStringLiteral("false"),
+                         m_FileMappingMountPath),
+            m_Computer ? m_Computer->uuid : QString(),
+            m_FileMappingSessionId);
+    return opened;
 }
 
 void Session::requestRuntimeBitrateChange(int bitrateKbps)
@@ -1922,50 +3086,97 @@ void Session::requestRuntimeBitrateChange(int bitrateKbps)
         return;
     }
 
-    try {
-        NvHTTP http(m_Computer);
+    // Coalesce rapid slider commits. A worker applying earlier values picks
+    // up the newest pending one via startRuntimeBitrateWorker() on finish,
+    // so the synchronous HTTP request never runs on the stream loop.
+    m_PendingRuntimeBitrateKbps.store(bitrateKbps, std::memory_order_release);
+    if (m_RuntimeBitrateInFlight.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    startRuntimeBitrateWorker();
+}
 
-        // Build clientname the same way as openConnection() does for /launch
-        QString clientname = QHostInfo::localHostName();
-        if (!m_Computer->uuid.isEmpty()) {
-            QString pairname = NvComputer::getPairname(m_Computer->uuid);
-            if (!pairname.isEmpty()) {
-                clientname = pairname;
-            }
+void Session::startRuntimeBitrateWorker()
+{
+    // Snapshot the connection under lock; the worker never touches Session
+    // or NvComputer (same pattern as startRemoteUsb()).
+    NvAddress address;
+    uint16_t httpsPort;
+    QString uuid;
+    QSslCertificate certificate;
+    {
+        QReadLocker locker(&m_Computer->lock);
+        address = m_Computer->activeAddress;
+        httpsPort = m_Computer->activeHttpsPort;
+        uuid = m_Computer->uuid;
+        certificate = m_Computer->serverCert;
+    }
+
+    // Build clientname the same way as openConnection() does for /launch
+    QString clientname = QHostInfo::localHostName();
+    if (!uuid.isEmpty()) {
+        QString pairname = NvComputer::getPairname(uuid);
+        if (!pairname.isEmpty()) {
+            clientname = pairname;
         }
-
-        QString args = QString("bitrate=%1&clientname=%2")
-                           .arg(bitrateKbps)
-                           .arg(clientname);
-
-        QString response = http.openConnectionToString(
-            http.m_BaseUrlHttps,
-            "bitrate",
-            args,
-            5000,
-            NvHTTP::NVLL_VERBOSE);
-
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Runtime bitrate change to %d kbps: %s",
-                    bitrateKbps,
-                    response.toUtf8().constData());
-
-        m_AbrCurrentBitrateKbps->store(bitrateKbps);
     }
-    catch (const GfeHttpResponseException& e) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Runtime bitrate change failed (HTTP): %s",
-                     e.toQString().toUtf8().constData());
-    }
-    catch (const QtNetworkReplyException& e) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Runtime bitrate change failed (Network): %s",
-                     e.toQString().toUtf8().constData());
-    }
-    catch (...) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Runtime bitrate change failed: unknown error");
-    }
+
+    auto bitrateToApply = std::make_shared<int>(
+        m_PendingRuntimeBitrateKbps.exchange(0, std::memory_order_acq_rel));
+    auto appliedBitrate = std::make_shared<std::atomic_int>(-1);
+
+    auto worker = QThread::create([bitrateToApply, appliedBitrate, address, httpsPort,
+                                   uuid, certificate, clientname] {
+        try {
+            NvHTTP http(address, httpsPort, certificate, true, nullptr, uuid);
+            QString args = QString("bitrate=%1&clientname=%2")
+                               .arg(*bitrateToApply)
+                               .arg(clientname);
+            QString response = http.openConnectionToString(
+                http.m_BaseUrlHttps,
+                "bitrate",
+                args,
+                5000,
+                NvHTTP::NVLL_VERBOSE);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Runtime bitrate change to %d kbps: %s",
+                        *bitrateToApply,
+                        response.toUtf8().constData());
+            appliedBitrate->store(*bitrateToApply);
+        }
+        catch (const GfeHttpResponseException& e) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Runtime bitrate change failed (HTTP): %s",
+                         e.toQString().toUtf8().constData());
+        }
+        catch (const QtNetworkReplyException& e) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Runtime bitrate change failed (Network): %s",
+                         e.toQString().toUtf8().constData());
+        }
+        catch (...) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Runtime bitrate change failed: unknown error");
+        }
+    });
+    connect(worker, &QThread::finished, this, [this, appliedBitrate]() {
+        const int applied = appliedBitrate->load();
+        if (applied > 0) {
+            m_AbrCurrentBitrateKbps->store(applied);
+            showStreamingToast(tr("Bitrate: %1").arg(
+                    OverlayMenuPanel::formatBitrateKbps(applied)));
+        }
+        // Commits that landed mid-flight are still pending; apply the
+        // newest one before going idle.
+        if (m_PendingRuntimeBitrateKbps.load(std::memory_order_acquire) != 0) {
+            startRuntimeBitrateWorker();
+        }
+        else {
+            m_RuntimeBitrateInFlight.store(false, std::memory_order_release);
+        }
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
 }
 
 void Session::startSunshineAbr()
@@ -2053,6 +3264,282 @@ void Session::stopSunshineAbr()
     }
 }
 
+void Session::startFileMappingUxProbe()
+{
+    appendFileMappingDiagnostic(
+            QStringLiteral("ux_probe.request"),
+            QStringLiteral("current_state=%1").arg(fileMappingStateName(m_FileMappingState)),
+            m_Computer ? m_Computer->uuid : QString(),
+            m_FileMappingSessionId);
+
+    m_FileMappingState = OverlayMenuPanel::FileMappingState::Checking;
+    m_FileMappingDetail = tr("Checking");
+    m_FileMappingToast = tr("Checking host file sharing...");
+    m_FileMappingToastPending = false;
+    updateFileMappingMenuState();
+
+    if (m_Computer == nullptr) {
+        m_FileMappingState = OverlayMenuPanel::FileMappingState::Unavailable;
+        m_FileMappingDetail = tr("Unavailable");
+        m_FileMappingToast = tr("Host file sharing is not available.");
+        appendFileMappingDiagnostic(
+                QStringLiteral("ux_probe.no_computer"),
+                m_FileMappingToast,
+                QString(),
+                m_FileMappingSessionId);
+        updateFileMappingMenuState();
+        return;
+    }
+
+    NvComputer computerSnapshot;
+    {
+        QReadLocker locker(&m_Computer->lock);
+        computerSnapshot = *m_Computer;
+    }
+
+    m_FileMappingProbeState = std::make_shared<FileMappingUx::ProbeState>();
+    FileMappingUx::startCapabilityProbe(std::move(computerSnapshot),
+                                        m_FileMappingProbeState,
+                                        2500);
+}
+
+void Session::processFileMappingUxProbeResult()
+{
+    if (!m_FileMappingProbeState) {
+        return;
+    }
+
+    bool available = false;
+    bool error = false;
+    QString detail;
+    QString message;
+    QString diagnosticsPath;
+    {
+        QMutexLocker locker(&m_FileMappingProbeState->lock);
+        if (!m_FileMappingProbeState->pending) {
+            return;
+        }
+        m_FileMappingProbeState->pending = false;
+        available = m_FileMappingProbeState->available;
+        error = m_FileMappingProbeState->error;
+        detail = m_FileMappingProbeState->detail;
+        message = m_FileMappingProbeState->message;
+        diagnosticsPath = m_FileMappingProbeState->diagnosticsPath;
+    }
+
+    m_FileMappingState = available ? OverlayMenuPanel::FileMappingState::Available :
+                         error ? OverlayMenuPanel::FileMappingState::Error :
+                         OverlayMenuPanel::FileMappingState::Unavailable;
+    m_FileMappingDetail = detail;
+    m_FileMappingToast = message;
+    m_FileMappingToastPending = available;
+    updateFileMappingMenuState();
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "File mapping UX probe: state=%d detail=%s message=%s diagnostics=%s",
+                static_cast<int>(m_FileMappingState),
+                m_FileMappingDetail.toUtf8().constData(),
+                m_FileMappingToast.toUtf8().constData(),
+                diagnosticsPath.toUtf8().constData());
+
+    if (m_FileMappingToastPending) {
+        m_FileMappingToastPending = false;
+        showStreamingToast(m_FileMappingToast, 2500);
+    }
+}
+
+void Session::startFileMappingMount()
+{
+    appendFileMappingDiagnostic(
+            QStringLiteral("mount.request"),
+            QStringLiteral("current_state=%1 existing_task=%2 mount_path=%3")
+                    .arg(fileMappingStateName(m_FileMappingState),
+                         m_FileMappingMountState ? QStringLiteral("true") : QStringLiteral("false"),
+                         m_FileMappingMountPath),
+            m_Computer ? m_Computer->uuid : QString(),
+            m_FileMappingSessionId);
+
+    if (m_FileMappingMountState) {
+        showStreamingToast(tr("Preparing host files..."), 2000);
+        return;
+    }
+
+    if (!m_FileMappingMountPath.isEmpty()) {
+        openFileMappingMountPath();
+        showStreamingToast(tr("Opening host files..."), 2000);
+        return;
+    }
+
+    m_FileMappingState = OverlayMenuPanel::FileMappingState::Mounting;
+    m_FileMappingDetail = tr("Preparing");
+    m_FileMappingToast = tr("Preparing host files...");
+    m_FileMappingToastPending = false;
+    updateFileMappingMenuState();
+    showStreamingToast(m_FileMappingToast, 2000);
+
+    if (m_Computer == nullptr) {
+        m_FileMappingState = OverlayMenuPanel::FileMappingState::Unavailable;
+        m_FileMappingDetail = tr("Unavailable");
+        m_FileMappingToast = tr("Host file sharing is not available.");
+        appendFileMappingDiagnostic(
+                QStringLiteral("mount.no_computer"),
+                m_FileMappingToast,
+                QString(),
+                m_FileMappingSessionId);
+        updateFileMappingMenuState();
+        return;
+    }
+
+    NvComputer computerSnapshot;
+    {
+        QReadLocker locker(&m_Computer->lock);
+        computerSnapshot = *m_Computer;
+    }
+
+    m_FileMappingMountState = std::make_shared<FileMappingUx::MountState>();
+    FileMappingUx::startMount(std::move(computerSnapshot),
+                              m_FileMappingSessionId,
+                              m_FileMappingMountState,
+                              8000);
+}
+
+void Session::processFileMappingMountResult()
+{
+    if (!m_FileMappingMountState) {
+        return;
+    }
+
+    bool ok = false;
+    QString detail;
+    QString message;
+    QString displayPath;
+    QString diagnosticsPath;
+    {
+        QMutexLocker locker(&m_FileMappingMountState->lock);
+        if (!m_FileMappingMountState->pending) {
+            return;
+        }
+        m_FileMappingMountState->pending = false;
+        ok = m_FileMappingMountState->ok;
+        detail = m_FileMappingMountState->detail;
+        message = m_FileMappingMountState->message;
+        displayPath = m_FileMappingMountState->displayPath;
+        diagnosticsPath = m_FileMappingMountState->diagnosticsPath;
+    }
+    m_FileMappingMountState.reset();
+
+    appendFileMappingDiagnostic(
+            QStringLiteral("mount.result"),
+            QStringLiteral("ok=%1 detail=%2 message=%3 display_path=%4 diagnostics=%5")
+                    .arg(ok ? QStringLiteral("true") : QStringLiteral("false"),
+                         detail,
+                         message,
+                         displayPath,
+                         diagnosticsPath),
+            m_Computer ? m_Computer->uuid : QString(),
+            m_FileMappingSessionId);
+
+    if (ok && !displayPath.isEmpty()) {
+        m_FileMappingMountPath = displayPath;
+        m_FileMappingState = OverlayMenuPanel::FileMappingState::Open;
+        m_FileMappingDetail = detail.isEmpty() ? tr("Open") : detail;
+        m_FileMappingToast = message.isEmpty() ? tr("Host files are ready.") : message;
+        updateFileMappingMenuState();
+        const bool opened = openFileMappingMountPath();
+        showStreamingToast(opened
+                           ? m_FileMappingToast
+                           : tr("Host files are ready, but the folder did not open. Check %1.").arg(m_FileMappingMountPath),
+                           3000);
+    }
+    else {
+        m_FileMappingMountPath.clear();
+        m_FileMappingState = OverlayMenuPanel::FileMappingState::Error;
+        m_FileMappingDetail = detail.isEmpty() ? tr("Error") : detail;
+        m_FileMappingToast = message.isEmpty() ? tr("Host files could not be opened.") : message;
+        updateFileMappingMenuState();
+        showStreamingToast(m_FileMappingToast, 4500);
+    }
+}
+
+void Session::cleanupFileMappingMount()
+{
+    appendFileMappingDiagnostic(
+            QStringLiteral("mount.cleanup"),
+            QStringLiteral("mount_path=%1").arg(m_FileMappingMountPath),
+            m_Computer ? m_Computer->uuid : QString(),
+            m_FileMappingSessionId);
+    m_FileMappingMountState.reset();
+    const QString mountPath = m_FileMappingMountPath;
+    m_FileMappingMountPath.clear();
+    if (!mountPath.isEmpty()) {
+        const bool generatedMirrorPath = isMoonlightGeneratedFileMappingMirrorPath(mountPath);
+#if defined(Q_OS_MACOS)
+        if (generatedMirrorPath) {
+            QProcess::execute(QStringLiteral("/sbin/umount"), { mountPath });
+        }
+#endif
+        if (generatedMirrorPath) {
+            const bool removed = QDir(mountPath).removeRecursively();
+            appendFileMappingDiagnostic(
+                    removed ? QStringLiteral("mount.cleanup.delete")
+                            : QStringLiteral("mount.cleanup.delete_failed"),
+                    QStringLiteral("mount_path=%1").arg(mountPath),
+                    m_Computer ? m_Computer->uuid : QString(),
+                    m_FileMappingSessionId);
+        }
+        else {
+            appendFileMappingDiagnostic(
+                    QStringLiteral("mount.cleanup.skip_delete"),
+                    QStringLiteral("mount_path=%1 reason=outside_moonlight_mirror").arg(mountPath),
+                    m_Computer ? m_Computer->uuid : QString(),
+                    m_FileMappingSessionId);
+        }
+    }
+}
+
+void Session::startFileMappingSmokeProbe()
+{
+    if (qEnvironmentVariableIntValue("MOONLIGHT_FILE_MAPPING_SMOKE") == 0) {
+        return;
+    }
+
+    if (m_Computer == nullptr) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "File mapping smoke skipped: no active computer");
+        return;
+    }
+
+    const QString mappingId = QString::fromLocal8Bit(qgetenv("MOONLIGHT_FILE_MAPPING_SMOKE_MAPPING")).trimmed();
+    const QString path = QString::fromLocal8Bit(qgetenv("MOONLIGHT_FILE_MAPPING_SMOKE_PATH")).trimmed();
+    if (mappingId.isEmpty() || path.isEmpty()) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "File mapping smoke skipped: set MOONLIGHT_FILE_MAPPING_SMOKE_MAPPING and MOONLIGHT_FILE_MAPPING_SMOKE_PATH");
+        return;
+    }
+
+    const int timeoutMs = readBoundedEnvInt("MOONLIGHT_FILE_MAPPING_SMOKE_TIMEOUT_MS", 5000, 1000, 60000);
+    const int offset = readBoundedEnvInt("MOONLIGHT_FILE_MAPPING_SMOKE_OFFSET", 0, 0, 1024 * 1024 * 1024);
+    const int length = readBoundedEnvInt("MOONLIGHT_FILE_MAPPING_SMOKE_LENGTH", 4096, 1, 1024 * 1024);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "Starting file mapping smoke probe: mapping=%s path=%s",
+                mappingId.toUtf8().constData(),
+                path.toUtf8().constData());
+
+    NvComputer computerSnapshot;
+    {
+        QReadLocker locker(&m_Computer->lock);
+        computerSnapshot = *m_Computer;
+    }
+
+    QThreadPool::globalInstance()->start(new FileMappingSmokeTask(std::move(computerSnapshot),
+                                                                  mappingId,
+                                                                  path,
+                                                                  static_cast<quint64>(offset),
+                                                                  static_cast<quint32>(length),
+                                                                  timeoutMs));
+}
+
 void Session::sendSunshineAbrFeedback()
 {
     if (!m_SunshineAbrEnabled || !m_Computer) {
@@ -2105,11 +3592,95 @@ void Session::notifyMouseEmulationMode(bool enabled)
 
     // We re-use the status update overlay for mouse mode notification
     if (m_MouseEmulationRefCount > 0) {
-        m_OverlayManager.updateOverlayText(Overlay::OverlayStatusUpdate, "Gamepad mouse mode active\nLong press Start to deactivate");
+        m_OverlayManager.updateOverlayText(
+            Overlay::OverlayStatusUpdate,
+            QStringLiteral("Gamepad mouse mode active\nLong press %1 to deactivate")
+                .arg(gamepadStartButtonName(m_InputHandler->getGamepadUiStyle()))
+                .toUtf8()
+                .constData());
         m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, true);
     }
     else {
         m_OverlayManager.setOverlayState(Overlay::OverlayStatusUpdate, false);
+    }
+}
+
+void Session::updateDualSenseHapticsControllerTarget()
+{
+    if (m_DualSenseHapticsRenderer != nullptr) {
+        m_DualSenseHapticsRenderer->setControllerTarget(
+            m_InputHandler != nullptr ?
+                m_InputHandler->getNativeDualSenseControllerNumber() : -1);
+    }
+}
+
+void Session::handleSdlUserEvent(const SDL_UserEvent& event)
+{
+    switch (event.code) {
+    case SDL_CODE_FRAME_READY:
+        if (m_VideoDecoder != nullptr) {
+            m_VideoDecoder->renderFrameOnMainThread();
+        }
+        break;
+    case SDL_CODE_FLUSH_WINDOW_EVENT_BARRIER:
+        m_FlushingWindowEventsRef--;
+        break;
+    case SDL_CODE_GAMECONTROLLER_RUMBLE:
+        m_InputHandler->rumble((uint16_t)(uintptr_t)event.data1,
+                               (uint16_t)((uintptr_t)event.data2 >> 16),
+                               (uint16_t)((uintptr_t)event.data2 & 0xFFFF));
+        break;
+    case SDL_CODE_GAMECONTROLLER_RUMBLE_TRIGGERS:
+        m_InputHandler->rumbleTriggers((uint16_t)(uintptr_t)event.data1,
+                                       (uint16_t)((uintptr_t)event.data2 >> 16),
+                                       (uint16_t)((uintptr_t)event.data2 & 0xFFFF));
+        break;
+    case SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE:
+        m_InputHandler->setMotionEventState((uint16_t)(uintptr_t)event.data1,
+                                            (uint8_t)((uintptr_t)event.data2 >> 16),
+                                            (uint16_t)((uintptr_t)event.data2 & 0xFFFF));
+        break;
+    case SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED:
+        m_InputHandler->setControllerLED((uint16_t)(uintptr_t)event.data1,
+                                         (uint8_t)((uintptr_t)event.data2 >> 16),
+                                         (uint8_t)((uintptr_t)event.data2 >> 8),
+                                         (uint8_t)((uintptr_t)event.data2));
+        break;
+    case SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS:
+        m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.data1,
+                                            (DualSenseOutputReport *)event.data2);
+        break;
+    case SDL_CODE_FLUSH_TOUCHPAD_FRAME:
+        m_InputHandler->flushPendingTouchpadFrameEvent();
+        break;
+    case SDL_CODE_FLUSH_CURSOR_VISIBILITY:
+        if (m_InputHandler != nullptr) {
+            m_InputHandler->flushPendingRemoteCursorHide();
+        }
+        break;
+    case SDL_CODE_CURSOR_UPDATE:
+    {
+        std::shared_ptr<RemoteCursorUpdate> cursorUpdate;
+        {
+            std::lock_guard<std::mutex> lock(m_CursorUpdateMutex);
+            cursorUpdate.swap(m_PendingCursorUpdate);
+            m_CursorUpdateEventQueued = false;
+        }
+        if (cursorUpdate != nullptr && m_InputHandler != nullptr) {
+            m_InputHandler->updateRemoteCursor(*cursorUpdate);
+        }
+        break;
+    }
+#if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || \
+        defined(HAVE_LINUX_DISPLAY_EVENT_MONITOR)
+    case SDL_CODE_PROCESS_QT_OVERLAY_EVENTS:
+        // The actual Qt processing happens after SDL dispatch below.
+        // Keeping this event side-effect free also coalesces bursts of
+        // native button messages without re-entering Qt from platform code.
+        break;
+#endif
+    default:
+        SDL_assert(false);
     }
 }
 
@@ -2133,6 +3704,16 @@ public:
 
 bool Session::tryReconnect()
 {
+    // Drop any forwarded USB device so the reconnect starts from a clean state.
+    teardownUsbTunnel();
+
+    // Release any locally tracked pressed keys before tearing down the dead connection.
+    // If the old control stream is still partly alive, this gives the host one last
+    // chance to clear stuck key state before reconnecting.
+    if (m_InputHandler != nullptr) {
+        m_InputHandler->raiseAllKeys(false);
+    }
+
     // The decoder can only be used between LiStartConnection() and
     // LiStopConnection(), so tear it down before stopping the dead connection.
     SDL_LockMutex(m_DecoderLock);
@@ -2142,7 +3723,15 @@ bool Session::tryReconnect()
 
     // Stop ABR feedback (startConnectionAsync() restarts it) and the dead connection
     stopSunshineAbr();
+    stopControllerRumbleAtConnectionBoundary(m_InputHandler);
+    if (m_DualSenseHapticsRenderer != nullptr) {
+        m_DualSenseHapticsRenderer->setControllerTarget(-1);
+    }
     LiStopConnection();
+    stopControllerRumbleAtConnectionBoundary(m_InputHandler);
+    if (m_DualSenseHapticsRenderer != nullptr) {
+        m_DualSenseHapticsRenderer->reset();
+    }
 
     // Total time budget for reconnect attempts before giving up
     const Uint32 graceMs = 60 * 1000;
@@ -2169,6 +3758,32 @@ bool Session::tryReconnect()
         return false;
     };
 
+    auto handleReconnectEvent = [this, &isCancelEvent](SDL_Event& ev) -> bool {
+        if (isCancelEvent(ev)) {
+            return true;
+        }
+
+        if (ev.type == SDL_USEREVENT) {
+            handleSdlUserEvent(ev.user);
+            return false;
+        }
+
+        if (m_InputHandler != nullptr &&
+            (ev.type == SDL_CONTROLLERDEVICEADDED ||
+             ev.type == SDL_CONTROLLERDEVICEREMOVED)) {
+            m_InputHandler->handleControllerDeviceEvent(&ev.cdevice, false);
+            updateDualSenseHapticsControllerTarget();
+        }
+        return false;
+    };
+
+    auto processReconnectQtEvents = [this]() {
+        if (m_Toast) {
+            m_Toast->beginEventProcessing();
+        }
+        processQtOverlayEvents();
+    };
+
     while (!cancelled && SDL_GetTicks() - startTicks < graceMs) {
         // Update the on-screen indicator (re-shown each attempt so it stays up)
         Uint32 remainingMs = graceMs - (SDL_GetTicks() - startTicks);
@@ -2178,13 +3793,15 @@ bool Session::tryReconnect()
 
         // Run the connection start on a worker thread and pump events while we wait
         m_AsyncConnectionSuccess = false;
+        m_HasReceivedVideo = false;
+        updateDualSenseHapticsControllerTarget();
         AsyncConnectionStartThread thread(this);
         thread.start();
 
         while (thread.isRunning()) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
-                if (isCancelEvent(ev)) {
+                if (handleReconnectEvent(ev)) {
                     cancelled = true;
                 }
             }
@@ -2192,7 +3809,7 @@ bool Session::tryReconnect()
                 // Abort the in-progress connection attempt
                 LiInterruptConnection();
             }
-            QCoreApplication::processEvents();
+            processReconnectQtEvents();
             SDL_Delay(10);
         }
         thread.wait();
@@ -2203,18 +3820,33 @@ bool Session::tryReconnect()
 
         if (m_AsyncConnectionSuccess) {
             reconnected = true;
+            if (m_ClipboardHelper != nullptr) {
+                m_ClipboardHelper->updateHostContext();
+            }
+            if (m_InputHandler != nullptr) {
+                m_InputHandler->notifyHostOfConnectedGamepads();
+                m_InputHandler->raiseAllKeys();
+            }
             break;
         }
 
         // Failed: clean up the partial attempt and back off before retrying
+        stopControllerRumbleAtConnectionBoundary(m_InputHandler);
+        if (m_DualSenseHapticsRenderer != nullptr) {
+            m_DualSenseHapticsRenderer->setControllerTarget(-1);
+        }
         LiStopConnection();
+        stopControllerRumbleAtConnectionBoundary(m_InputHandler);
+        if (m_DualSenseHapticsRenderer != nullptr) {
+            m_DualSenseHapticsRenderer->reset();
+        }
 
         Uint32 backoffUntil = SDL_GetTicks() + backoffMs;
         while (SDL_GetTicks() < backoffUntil &&
                SDL_GetTicks() - startTicks < graceMs) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
-                if (isCancelEvent(ev)) {
+                if (handleReconnectEvent(ev)) {
                     cancelled = true;
                     break;
                 }
@@ -2222,7 +3854,7 @@ bool Session::tryReconnect()
             if (cancelled) {
                 break;
             }
-            QCoreApplication::processEvents();
+            processReconnectQtEvents();
             SDL_Delay(10);
         }
 
@@ -2237,7 +3869,7 @@ bool Session::tryReconnect()
         // format. Recreate the decoder through the normal reset path.
         SDL_Event resetEvent = {};
         resetEvent.type = SDL_RENDER_DEVICE_RESET;
-        SDL_PushEvent(&resetEvent);
+        pushEventOrWarn(resetEvent);
 
         // Streaming is healthy again, so a subsequent SDL_QUIT is expected
         // to mean a real termination rather than another reconnect.
@@ -2402,11 +4034,48 @@ bool Session::startConnectionAsync()
 
     QString rtspSessionUrl;
 
-    // Query display HDR brightness capabilities
+    // Resolve the HDR brightness profile for Foundation Sunshine. SDR white
+    // is independent from the mastering-luminance tuple: the host needs it
+    // even when peak/min/full-frame brightness uses host defaults or a manual
+    // profile.
     float maxBrightness = 0, minBrightness = 0, maxAverageBrightness = 0;
+    float detectedMaxBrightness = 0, detectedMinBrightness = 0;
+    float detectedMaxAverageBrightness = 0, sdrWhiteBrightness = 0;
 #ifdef Q_OS_WIN32
-    queryDisplayHdrBrightness(maxBrightness, minBrightness, maxAverageBrightness);
+    if (m_StreamConfig.hdrMode != 0) {
+        queryDisplayHdrBrightness(m_ClientDisplayName,
+                                  detectedMaxBrightness,
+                                  detectedMinBrightness,
+                                  detectedMaxAverageBrightness,
+                                  sdrWhiteBrightness);
+    }
 #endif
+    switch (m_Preferences->hdrBrightnessMode) {
+    case StreamingPreferences::HBM_MANUAL:
+        maxBrightness = static_cast<float>(m_Preferences->hdrMaxBrightness);
+        minBrightness = static_cast<float>(m_Preferences->hdrMinBrightness);
+        maxAverageBrightness = static_cast<float>(m_Preferences->hdrMaxAverageBrightness);
+
+        if (maxBrightness <= 0 || minBrightness < 0 ||
+                maxAverageBrightness <= 0 || minBrightness > maxAverageBrightness ||
+                maxAverageBrightness > maxBrightness) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Ignoring invalid manual HDR brightness profile: max=%.3f, min=%.6f, maxAverage=%.3f",
+                        maxBrightness, minBrightness, maxAverageBrightness);
+            maxBrightness = minBrightness = maxAverageBrightness = 0;
+        }
+        break;
+    case StreamingPreferences::HBM_AUTO:
+#ifdef Q_OS_WIN32
+        maxBrightness = detectedMaxBrightness;
+        minBrightness = detectedMinBrightness;
+        maxAverageBrightness = detectedMaxAverageBrightness;
+#endif
+        break;
+    case StreamingPreferences::HBM_HOST_DEFAULT:
+    default:
+        break;
+    }
 
     try {
         NvHTTP http(m_Computer);
@@ -2420,8 +4089,10 @@ bool Session::startConnectionAsync()
             m_Preferences->height,
             maxBrightness,
             minBrightness,
-            maxAverageBrightness
+            maxAverageBrightness,
+            sdrWhiteBrightness
         );
+        m_LastClientSdrWhiteNits = sdrWhiteBrightness;
         http.startApp(resumingSession ? "resume" : "launch",
                       m_Computer->isNvidiaServerSoftware,
                       m_App.id, &m_StreamConfig,
@@ -2430,8 +4101,9 @@ bool Session::startConnectionAsync()
                       m_InputHandler->getAttachedGamepadMask(),
                       !m_Preferences->multiController,
                       rtspSessionUrl,
-                      m_Preferences->customScreenMode,
-                      m_Preferences->customVddScreenMode,
+                      m_Preferences->screenCombinationMode,
+                      m_LaunchUseVdd,
+                      m_LaunchDisplayName,
                       remoteStreamConfig);
 
         try {
@@ -2526,8 +4198,21 @@ bool Session::startConnectionAsync()
         return false;
     }
 
+    if (m_InputHandler != nullptr) {
+        const int cursorResult =
+            LiSetCursorMode(m_InputHandler->getLocalCursorMode());
+        if (cursorResult != LI_CURSOR_MODE_OK &&
+            cursorResult != LI_CURSOR_MODE_ERR_UNSUPPORTED) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Failed to set initial local cursor mode: %d",
+                        cursorResult);
+        }
+    }
+
     emit connectionStarted();
     startSunshineAbr();
+    startFileMappingUxProbe();
+    startFileMappingSmokeProbe();
     if (m_Preferences->enableMicrophone) {
         // Use the deferred mic toggle mechanism instead of QueuedConnection to avoid
         // heap corruption when creating QAudioSource within nested event loops (processEvents).
@@ -2550,7 +4235,7 @@ void Session::flushWindowEvents()
     SDL_Event flushEvent = {};
     flushEvent.type = SDL_USEREVENT;
     flushEvent.user.code = SDL_CODE_FLUSH_WINDOW_EVENT_BARRIER;
-    SDL_PushEvent(&flushEvent);
+    pushEventOrWarn(flushEvent);
 }
 
 void Session::setShouldExit(bool quitHostApp)
@@ -2574,17 +4259,47 @@ void Session::start()
     // We're now active
     s_ActiveSession = this;
 
-    // Construct the clipboard sync helper on the GUI thread before the
-    // control receive thread can possibly invoke clClipboardData(). It is
-    // started after a successful connection in clConnectionStatusUpdate.
-    if (m_ClipboardSync == nullptr) {
-        m_ClipboardSync = new ClipboardSync(m_Computer, this);
-        m_ClipboardSync->start();
+#ifndef STEAM_LINK
+    // Construct the clipboard sync helper process before the control receive
+    // thread can possibly invoke clClipboardData(). Host frames are queued by
+    // ClipboardHelperClient and flushed from the SDL loop.
+    if (m_ClipboardHelper == nullptr) {
+        m_ClipboardHelper = new ClipboardHelperClient(m_Computer, this);
+        m_ClipboardHelper->start();
+    }
+#endif
+
+    bool enablePhysicalDualSenseHaptics = false;
+    k_ConnCallbacks.ds5HapticsPcm = nullptr;
+    k_ConnCallbacks.ds5HapticsIrV2 = nullptr;
+    if (m_Preferences->dualSenseHapticsMode == StreamingPreferences::DSHM_PHYSICAL) {
+#ifdef Q_OS_WIN32
+        enablePhysicalDualSenseHaptics = true;
+        k_ConnCallbacks.ds5HapticsPcm = Session::clDs5HapticsPcm;
+        if (m_DualSenseHapticsRenderer == nullptr) {
+            m_DualSenseHapticsRenderer = new DualSenseHapticsRenderer();
+        }
+        if (!DualSenseHapticsRenderer::isAvailable()) {
+            emitLaunchWarning(tr("Physical DualSense haptics was selected, but no active USB DualSense four-channel audio endpoint was found yet. Moonlight will keep checking during this stream."));
+        }
+#else
+        emitLaunchWarning(tr("Physical DualSense haptics is only available on Windows in this build."));
+#endif
+    }
+    else {
+#ifdef Q_OS_MACOS
+        if (m_DualSenseHapticsRenderer == nullptr) {
+            m_DualSenseHapticsRenderer = new DualSenseHapticsRenderer();
+        }
+#endif
+        k_ConnCallbacks.ds5HapticsIrV2 = Session::clDs5HapticsIrV2;
     }
 
-    // Initialize the gamepad code with our preferences
-    // NB: m_InputHandler must be initialize before starting the connection.
-    m_InputHandler = new SdlInputHandler(*m_Preferences, m_StreamConfig.width, m_StreamConfig.height);
+    // Initialize the gamepad code with the effective (post-preflight) capability.
+    // NB: m_InputHandler must be initialized before starting the connection.
+    m_InputHandler = new SdlInputHandler(*m_Preferences, m_StreamConfig.width,
+                                         m_StreamConfig.height, enablePhysicalDualSenseHaptics);
+    updateDualSenseHapticsControllerTarget();
 
     // Kick off the async connection thread then return to the caller to pump the event loop
     auto thread = new AsyncConnectionStartThread(this);
@@ -2602,17 +4317,122 @@ void Session::interrupt()
     SDL_Event event;
     event.type = SDL_QUIT;
     event.quit.timestamp = SDL_GetTicks();
-    SDL_PushEvent(&event);
+    pushEventOrWarn(event);
 }
 
 #ifdef Q_OS_WIN32
-void Session::queryDisplayHdrBrightness(float& maxNits, float& minNits, float& maxFullNits)
+float Session::queryDisplaySdrWhiteNits(const QString& displayName, bool logFailures)
+{
+    if (displayName.isEmpty()) {
+        return 0.0f;
+    }
+
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    LONG status = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+                                               &pathCount, &modeCount);
+    if (status != ERROR_SUCCESS) {
+        if (!logFailures) {
+            return 0.0f;
+        }
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "GetDisplayConfigBufferSizes() failed for SDR white query: %ld",
+                    status);
+        return 0.0f;
+    }
+
+    // The topology can change between sizing and querying. Retry once with
+    // fresh buffer sizes if Windows reports an insufficient buffer.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+        UINT32 queriedPathCount = pathCount;
+        UINT32 queriedModeCount = modeCount;
+        status = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                    &queriedPathCount, paths.data(),
+                                    &queriedModeCount, modes.data(), nullptr);
+        if (status == ERROR_INSUFFICIENT_BUFFER) {
+            status = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+                                                  &pathCount, &modeCount);
+            if (status == ERROR_SUCCESS) {
+                continue;
+            }
+        }
+        if (status != ERROR_SUCCESS) {
+            if (!logFailures) {
+                return 0.0f;
+            }
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "QueryDisplayConfig() failed for SDR white query: %ld",
+                        status);
+            return 0.0f;
+        }
+
+        paths.resize(queriedPathCount);
+        for (const DISPLAYCONFIG_PATH_INFO& path : paths) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+            sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            sourceName.header.size = sizeof(sourceName);
+            sourceName.header.adapterId = path.sourceInfo.adapterId;
+            sourceName.header.id = path.sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS ||
+                    displayName.compare(QString::fromWCharArray(sourceName.viewGdiDeviceName),
+                                        Qt::CaseInsensitive) != 0) {
+                continue;
+            }
+
+            DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel = {};
+            whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            whiteLevel.header.size = sizeof(whiteLevel);
+            whiteLevel.header.adapterId = path.targetInfo.adapterId;
+            whiteLevel.header.id = path.targetInfo.id;
+            status = DisplayConfigGetDeviceInfo(&whiteLevel.header);
+            if (status != ERROR_SUCCESS) {
+                if (!logFailures) {
+                    return 0.0f;
+                }
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "DisplayConfigGetDeviceInfo(SDR_WHITE_LEVEL) failed for %s: %ld",
+                            qPrintable(displayName), status);
+                return 0.0f;
+            }
+
+            // Windows stores this as a fixed-point multiplier where 1000 is
+            // the standard 80-nit SDR white level.
+            const float nits = static_cast<float>(whiteLevel.SDRWhiteLevel) * 80.0f / 1000.0f;
+            if (nits < 50.0f || nits > 1000.0f) {
+                if (!logFailures) {
+                    return 0.0f;
+                }
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Ignoring out-of-range SDR white level for %s: %.1f nits",
+                            qPrintable(displayName), nits);
+                return 0.0f;
+            }
+            return nits;
+        }
+
+        if (logFailures) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Unable to map display %s to an active DisplayConfig path",
+                        qPrintable(displayName));
+        }
+        return 0.0f;
+    }
+
+    return 0.0f;
+}
+
+void Session::queryDisplayHdrBrightness(const QString& preferredDisplayName,
+                                        float& maxNits, float& minNits,
+                                        float& maxFullNits, float& sdrWhiteNits)
 {
     using Microsoft::WRL::ComPtr;
 
     maxNits = 0;
     minNits = 0;
     maxFullNits = 0;
+    sdrWhiteNits = 0;
 
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) {
@@ -2620,7 +4440,18 @@ void Session::queryDisplayHdrBrightness(float& maxNits, float& minNits, float& m
         return;
     }
 
-    // Enumerate adapters and outputs to find HDR-capable display
+    struct DisplayBrightness {
+        QString name;
+        float maxNits = 0;
+        float minNits = 0;
+        float maxFullNits = 0;
+        bool hdr = false;
+
+        bool isValid() const { return !name.isEmpty(); }
+    } preferred, firstHdr, firstDisplay;
+
+    // Prefer the display that owns the launch UI. If it cannot be matched,
+    // retain the previous behavior of selecting the first HDR display.
     ComPtr<IDXGIAdapter1> adapter;
     for (UINT adapterIdx = 0; SUCCEEDED(factory->EnumAdapters1(adapterIdx, &adapter)); adapterIdx++) {
         ComPtr<IDXGIOutput> output;
@@ -2629,30 +4460,42 @@ void Session::queryDisplayHdrBrightness(float& maxNits, float& minNits, float& m
             if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), (void**)&output6))) {
                 DXGI_OUTPUT_DESC1 desc1;
                 if (SUCCEEDED(output6->GetDesc1(&desc1))) {
-                    // Use the first display with HDR support, or the first display if none support HDR
-                    if (maxNits == 0 || desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-                        maxNits = desc1.MaxLuminance;
-                        minNits = desc1.MinLuminance;
-                        maxFullNits = desc1.MaxFullFrameLuminance;
+                    DisplayBrightness candidate;
+                    candidate.name = QString::fromWCharArray(desc1.DeviceName);
+                    candidate.maxNits = desc1.MaxLuminance;
+                    candidate.minNits = desc1.MinLuminance;
+                    candidate.maxFullNits = desc1.MaxFullFrameLuminance;
+                    candidate.hdr = desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
 
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "Display HDR brightness: max=%.1f nits, min=%.4f nits, maxFull=%.1f nits (HDR: %s)",
-                                    maxNits, minNits, maxFullNits,
-                                    desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? "yes" : "no");
-
-                        if (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-                            return; // Found an HDR display, use it
-                        }
+                    if (!firstDisplay.isValid()) {
+                        firstDisplay = candidate;
+                    }
+                    if (candidate.hdr && !firstHdr.isValid()) {
+                        firstHdr = candidate;
+                    }
+                    if (!preferredDisplayName.isEmpty() &&
+                            candidate.name.compare(preferredDisplayName,
+                                                   Qt::CaseInsensitive) == 0) {
+                        preferred = candidate;
                     }
                 }
             }
+            output.Reset();
         }
+        adapter.Reset();
     }
 
-    if (maxNits > 0) {
+    const DisplayBrightness selected = preferred.isValid() ? preferred :
+                                       (firstHdr.isValid() ? firstHdr : firstDisplay);
+    if (selected.isValid()) {
+        maxNits = selected.maxNits;
+        minNits = selected.minNits;
+        maxFullNits = selected.maxFullNits;
+        sdrWhiteNits = queryDisplaySdrWhiteNits(selected.name);
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "Using SDR display brightness: max=%.1f, min=%.4f, maxFull=%.1f",
-                    maxNits, minNits, maxFullNits);
+                    "Client display brightness (%s): max=%.1f nits, min=%.4f nits, maxFull=%.1f nits, SDR white=%.1f nits (HDR: %s)",
+                    qPrintable(selected.name), maxNits, minNits, maxFullNits,
+                    sdrWhiteNits, selected.hdr ? "yes" : "no");
     } else {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "No display brightness information available");
@@ -2660,15 +4503,37 @@ void Session::queryDisplayHdrBrightness(float& maxNits, float& minNits, float& m
 }
 #endif
 
+// 加载页退场淡幕的时长上限，比 StreamSegue.qml 里那条 340ms 动画留一点余量。
+// 两边要一起改。
+static const int k_StreamEnterVeilMs = 380;
+
+// 等全屏切换完成的兜底超时。macOS 的全屏动画约 0.5~0.7s，取个宽松上限；
+// 万一平台不发 SIZE_CHANGED，也不能让界面窗口一直留着。
+static const Uint32 k_FullScreenEntryTimeoutMs = 1200;
+
 void Session::exec()
 {
+
     // If the connection failed, clean up and abort the connection.
     if (!m_AsyncConnectionSuccess) {
+        if (m_ClipboardHelper != nullptr) {
+            stopClipboardHelper();
+        }
+        if (m_DualSenseHapticsRenderer != nullptr) {
+            m_DualSenseHapticsRenderer->setControllerTarget(-1);
+        }
+        stopControllerRumbleAtConnectionBoundary(m_InputHandler);
         delete m_InputHandler;
         m_InputHandler = nullptr;
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         QThreadPool::globalInstance()->start(new DeferredSessionCleanupTask(this));
+        // Release the forwarded USB device with the stream, not with the Session.
+        teardownUsbTunnel();
         return;
+    }
+
+    if (m_ClipboardHelper != nullptr) {
+        m_ClipboardHelper->updateHostContext();
     }
 
     // Pump the Qt event loop one last time before we create our SDL window
@@ -2679,6 +4544,42 @@ void Session::exec()
 
     int x, y, width, height;
     getWindowDimensions(x, y, width, height);
+
+    // 全屏会话：让串流窗口从 Qt 界面窗口所在的位置和尺寸起步。
+    //
+    // getWindowDimensions() 给的是「屏幕居中 + 串流分辨率」，那是退出全屏之后
+    // 该有的窗口大小，但拿它当全屏动画的起点就不对了 —— 系统会从一个和刚才那个
+    // 界面窗口毫无关系的矩形开始放大，看起来像凭空弹出一个空窗口再被撑大。
+    // 用界面窗口自己的 frame 起步，动画读起来就是「刚才那个窗口变成了全屏」。
+    //
+    // 这里只改初始创建；运行中 Ctrl+Alt+Shift+F 退出全屏时走的是 toggleFullscreen()
+    // 里的那次 getWindowDimensions()，恢复的仍然是串流分辨率大小。
+    if (m_IsFullScreen && m_QtWindow != nullptr) {
+        const QRect creationGeometry = qtWindowCreationGeometryForSdl(m_QtWindow);
+        if (creationGeometry.isValid()) {
+            x = creationGeometry.x();
+            y = creationGeometry.y();
+            width = creationGeometry.width();
+            height = creationGeometry.height();
+        }
+    }
+
+    // 让加载页的退场动画真正跑完，再去创建串流窗口。
+    //
+    // connectionStarted 和 exec() 是同一批投递到主线程的信号，所以那个 340ms 的
+    // 淡幕动画实际上拿不到任何主循环时间 —— 幕从来没黑下来过，SDL 窗口就直接盖在
+    // 加载页上，观感是硬切。这里主动把主循环喂满一段时间让它跑完。
+    //
+    // 必须在这儿做完：exec() 往下就进 SDL 事件循环了，那之后 Qt 的定时器和队列信号
+    // 只在串流覆盖层可见时才会被 pump，QML 侧再也等不到机会。
+    if (m_QtWindow != nullptr) {
+        QElapsedTimer veilTimer;
+        veilTimer.start();
+        while (veilTimer.elapsed() < k_StreamEnterVeilMs) {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+            SDL_Delay(4);
+        }
+    }
 
 #ifdef STEAM_LINK
     // We need a little delay before creating the window or we will trigger some kind
@@ -2751,6 +4652,13 @@ void Session::exec()
                          "SDL_CreateWindow() failed: %s",
                          SDL_GetError());
 
+            if (m_ClipboardHelper != nullptr) {
+                stopClipboardHelper();
+            }
+            if (m_DualSenseHapticsRenderer != nullptr) {
+                m_DualSenseHapticsRenderer->setControllerTarget(-1);
+            }
+            stopControllerRumbleAtConnectionBoundary(m_InputHandler);
             delete m_InputHandler;
             m_InputHandler = nullptr;
             SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -2787,8 +4695,42 @@ void Session::exec()
     updateOptimalWindowDisplayMode();
 
     // Enter full screen if requested
+    bool awaitingFullScreenEntry = false;
     if (m_IsFullScreen) {
-        SDL_SetWindowFullscreen(m_Window, m_FullScreenFlag);
+        if (SDL_SetWindowFullscreen(m_Window, m_FullScreenFlag) == 0) {
+            awaitingFullScreenEntry = true;
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "SDL_SetWindowFullscreen() failed: %s",
+                        SDL_GetError());
+        }
+    }
+
+    // 串流窗口就位之后才隐藏界面窗口。
+    //
+    // 以前这件事在 QML 的退场动画末尾做（hideForStreaming），时机太早：macOS 上
+    // 全屏窗口会切进一个新的 Space，界面窗口一旦提前藏掉，旧 Space 在整个切换动画
+    // 期间露出来的就是桌面。留着它（上面盖着那层已经全黑的幕）观感是连续的。
+    //
+    // 但也不能在这儿就藏：SDL_SetWindowFullscreen() 在 macOS 上是异步的，它在 Cocoa
+    // 的 toggleFullScreen: 动画一开始就返回，那会儿旧 Space 还在往外滑。所以这里只
+    // 登记一个截止时间，真正的隐藏交给事件循环 —— 收到 SIZE_CHANGED（Cocoa 在全屏
+    // 切换结束后才发）就藏，收不到就等超时兜底。
+    //
+    // 由 C++ 来做是因为 QML 等不到通知：往下就进 SDL 事件循环了，那之后 Qt 的队列
+    // 信号和定时器只在串流覆盖层可见时才会被 pump。
+    Uint32 qtWindowHideDeadline = 0;
+    if (m_QtWindow != nullptr) {
+        if (awaitingFullScreenEntry) {
+            qtWindowHideDeadline = SDL_GetTicks() + k_FullScreenEntryTimeoutMs;
+        }
+        else {
+            // 没有全屏切换要等：窗口化会话，或者上面那次请求失败了。
+            // 失败也照样藏 —— 界面窗口在串流期间没有任何作用，留着它只会把一张
+            // 停在加载页的窗口压在串流窗口后面。
+            m_QtWindow->setVisible(false);
+        }
     }
 
     bool needsFirstEnterCapture = false;
@@ -2847,9 +4789,37 @@ void Session::exec()
     m_MenuPanel = new OverlayMenuPanel();
     m_MenuButton = nullptr;
     m_Toast = new OverlayToast();
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+    // Developer-only harness: Session supplies integration callbacks while
+    // the test class owns the panel, picker, replay scheduler, and cleanup.
+    m_StylusReplayTest = std::make_unique<StylusReplayTest>(
+            m_Window,
+            [this](const QString& message, int durationMs) {
+                showStreamingToast(message, durationMs);
+            },
+            [this]() {
+                restoreCaptureAfterStylusReplayPanel();
+            });
+#endif
     m_MenuPanel->setActionCallback([this](OverlayMenuPanel::MenuAction action) {
         dispatchQtMenuAction(action);
     });
+    m_MenuPanel->setRemoteUsbDeviceCallback([this](const QString& deviceId) {
+        startRemoteUsb(deviceId);
+    });
+    m_MenuPanel->setRemoteUsbReleaseCallback([this] {
+        stopRemoteUsb();
+    });
+    m_MenuPanel->setBitrateChangeCallback([this](int bitrateKbps) {
+        // Manual adjustment takes over from the settings page auto-recompute.
+        m_Preferences->autoAdjustBitrate = false;
+        m_Preferences->bitrateKbps = bitrateKbps;
+        m_Preferences->save();
+        // Applied asynchronously; the toast confirms the value the host
+        // actually accepted (see startRuntimeBitrateWorker()).
+        requestRuntimeBitrateChange(bitrateKbps);
+    });
+    updateRemoteUsbMenuState();
     m_MenuPanel->setCloseCallback([this]() {
         // Record close timestamp for edge-trigger debounce
         m_MenuCloseTicks = SDL_GetTicks();
@@ -2859,56 +4829,109 @@ void Session::exec()
         // we defer capture restoration to after the action completes.
         // See dispatchQtMenuAction() for those cases.
         if (m_WasCapturedBeforeMenu && !m_DeferCaptureRestore) {
-            m_InputHandler->setCaptureActive(true);
+            if (isStreamingWindowVisible()) {
+                m_InputHandler->setCaptureActive(true);
+            }
             m_WasCapturedBeforeMenu = false;
         }
 
-        // Re-show the floating menu button if in button mode
-        if (m_MenuButton && m_Preferences->overlayMenuPosition == StreamingPreferences::OMP_BUTTON) {
-            int wx, wy, ww, wh;
-            SDL_GetWindowPosition(m_Window, &wx, &wy);
-            SDL_GetWindowSize(m_Window, &ww, &wh);
-            m_MenuButton->showButton(wx, wy, ww, wh);
-        }
+        syncQtOverlayWindowsWithSdlWindowState();
 
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "Qt overlay menu closed, capture %s",
                     m_DeferCaptureRestore ? "deferred" : "restored");
     });
 
-    // Create floating menu button if configured
+    // Keep a hidden button ready so placement can switch during a stream
+    // without creating a window from inside an input callback.
+#ifdef Q_OS_DARWIN
+    m_MacQtEventPumpInputGuard =
+            std::make_unique<MacQtEventPumpInputGuard>(m_Window);
+#endif
+    m_MenuButton = new OverlayMenuButton();
+#if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || \
+        defined(HAVE_LINUX_DISPLAY_EVENT_MONITOR)
+    m_MenuButton->setEventWakeCallback([]() {
+        SDL_Event wakeEvent = {};
+        wakeEvent.type = SDL_USEREVENT;
+        wakeEvent.user.code = SDL_CODE_PROCESS_QT_OVERLAY_EVENTS;
+        pushEventOrWarn(wakeEvent);
+    });
+#endif
+    m_MenuButton->setClickCallback([this](const QPoint& globalPosition,
+                                          bool closeWhenPointerOutside) {
+        showQtOverlayMenu(globalPosition, closeWhenPointerOutside);
+    });
+
     if (m_Preferences->overlayMenuPosition == StreamingPreferences::OMP_BUTTON) {
-        m_MenuButton = new OverlayMenuButton();
-        m_MenuButton->setClickCallback([this]() {
-            showQtOverlayMenu();
-        });
         // Show button at initial position
-        int wx, wy, ww, wh;
-        SDL_GetWindowPosition(m_Window, &wx, &wy);
-        SDL_GetWindowSize(m_Window, &ww, &wh);
-        m_MenuButton->showButton(wx, wy, ww, wh);
+        const QRect parentRect = qtOverlayGeometryForSdlWindow(m_Window);
+        if (parentRect.isValid()) {
+            m_MenuButton->showButton(parentRect.x(), parentRect.y(),
+                                     parentRect.width(), parentRect.height());
+        }
     }
 
     // Switch to async logging mode when we enter the SDL loop
     StreamUtils::enterAsyncLoggingMode();
 
-    // Hijack this thread to be the SDL main thread. We still need to pump Qt
-    // periodically while streaming because ClipboardSync relies on Qt's event
-    // loop for QClipboard notifications, queued inbound frames, and QNAM blob
-    // callbacks. Without this, PNG clipboard sync can stall on every platform.
-    constexpr Uint32 QT_EVENT_PUMP_INTERVAL_MS = 10;
+    // Hijack this thread to be the SDL main thread. Pump Qt periodically only
+    // while transient streaming UI is active; clipboard sync runs in a helper
+    // process with its own Qt event loop and is serviced via pipe polling below.
+    constexpr Uint32 QT_UI_EVENT_PUMP_INTERVAL_MS = 10;
     Uint32 lastQtEventPumpTicks = 0;
-    auto processQtEventsDuringStream = [this, &lastQtEventPumpTicks](bool force = false) {
-        const bool qtUiVisible = (m_MenuPanel && m_MenuPanel->needsEventProcessing()) ||
-                                 (m_Toast && m_Toast->isVisible());
+    auto qtUiNeedsEventProcessing = [this]() {
+        // The floating button remains visible for the entire stream. Treating
+        // visibility as active Qt work forces this SDL loop to wake and drain
+        // all Qt events every 10 ms even while the button is idle, which can
+        // delay input and video processing.
+        // Remote USB 转发的 queued 工作投递在本线程（helper spawn 的
+        // worker-finished lambda、tunnel 状态通知、helper stderr 排水），
+        // 而本循环已取代 app.exec()、只在返回 true 时泵事件：转发存续期间
+        // 必须保持泵转，否则 helper 无法启动、日志会写满 stderr 管道把
+        // moonlight-usbd 卡死、tunnel 的 forwarding/finished 通知也收不到。
+        // 隧道的数据面跑在自己的 IO 线程（usbforwardingtunnel.cpp），不依赖
+        // 本泵——1000Hz 鼠标的 URB 洪流不再与输入处理争抢本线程。
+        return (m_MenuPanel && m_MenuPanel->needsEventProcessing()) ||
+               (m_MenuButton && m_MenuButton->needsEventProcessing()) ||
+               (m_Toast && m_Toast->needsEventProcessing()) ||
+               m_UsbCapabilityPending || m_UsbLocalServer != nullptr ||
+               m_UsbTunnel != nullptr ||
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+               (m_StylusReplayTest && m_StylusReplayTest->isPanelVisible());
+#else
+               false;
+#endif
+    };
+    auto processQtEventsDuringStream = [this, &lastQtEventPumpTicks,
+                                        &qtUiNeedsEventProcessing](bool force = false) {
+        if (!qtUiNeedsEventProcessing()) {
+            return;
+        }
+
         const Uint32 now = SDL_GetTicks();
-        if (!force && !qtUiVisible && now - lastQtEventPumpTicks < QT_EVENT_PUMP_INTERVAL_MS) {
+        if (!force && now - lastQtEventPumpTicks < QT_UI_EVENT_PUMP_INTERVAL_MS) {
             return;
         }
         lastQtEventPumpTicks = now;
-        QCoreApplication::processEvents(qtUiVisible
-                                        ? QEventLoop::AllEvents
-                                        : QEventLoop::ExcludeUserInputEvents);
+        if (m_MenuButton) {
+            // Clear before processing so an update requested from inside a Qt
+            // handler remains pending and schedules a second pass.
+            m_MenuButton->beginEventProcessing();
+        }
+        if (m_Toast) {
+            m_Toast->beginEventProcessing();
+        }
+        processQtOverlayEvents();
+        if (m_MenuButton) {
+            m_MenuButton->finishEventProcessing();
+        }
+    };
+
+    auto processClipboardHelperMessages = [this]() {
+        if (m_ClipboardHelper != nullptr) {
+            m_ClipboardHelper->processPendingMessages();
+        }
     };
 
     constexpr Uint32 ABR_FEEDBACK_INTERVAL_MS = 3000;
@@ -2924,9 +4947,76 @@ void Session::exec()
         }
     };
 
+#ifdef Q_OS_WIN32
+    constexpr Uint32 SDR_WHITE_CHECK_INTERVAL_MS = 1000;
+    Uint32 lastSdrWhiteCheckTicks = 0;
+    auto processClientSdrWhiteUpdate = [this, &lastSdrWhiteCheckTicks]() {
+        if (m_StreamConfig.hdrMode == 0 ||
+                (LiGetHostFeatureFlags() & LI_FF_DYNAMIC_SDR_WHITE) == 0) {
+            return;
+        }
+
+        const Uint32 now = SDL_GetTicks();
+        if (now - lastSdrWhiteCheckTicks < SDR_WHITE_CHECK_INTERVAL_MS) {
+            return;
+        }
+        lastSdrWhiteCheckTicks = now;
+
+        const int displayIndex = SDL_GetWindowDisplayIndex(m_Window);
+        QScreen* clientScreen = qtScreenForSdlDisplay(
+            displayIndex, SdlDisplayMatchPolicy::ExactOnly);
+        if (clientScreen == nullptr || clientScreen->name().isEmpty()) {
+            return;
+        }
+
+        // SDL exposes a friendly monitor name on Windows, while DisplayConfig
+        // source paths use the GDI device name (for example, \\.\DISPLAY1).
+        // QScreen::name() is the latter, so resolve the SDL display first.
+        const float nits = queryDisplaySdrWhiteNits(clientScreen->name(), false);
+        if (nits < 50.0f || qAbs(nits - m_LastClientSdrWhiteNits) < 0.5f) {
+            return;
+        }
+
+        const int result = LiSendClientSdrWhiteNits(nits);
+        if (result == LI_DYNAMIC_SDR_WHITE_OK) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Updated host client SDR white level: %.1f nits", nits);
+            m_LastClientSdrWhiteNits = nits;
+        }
+        else if (result != LI_DYNAMIC_SDR_WHITE_ERR_UNSUPPORTED) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Failed to update host client SDR white level: %d", result);
+        }
+    };
+#endif
+
+    // 见上面 qtWindowHideDeadline 处的注释：串流窗口真的落定了（或者等超时了）
+    // 再把界面窗口藏掉。
+    auto hideGuiWindowWhenSettled = [&](bool settled) {
+        if (qtWindowHideDeadline == 0 || m_QtWindow == nullptr) {
+            return;
+        }
+        if (settled || SDL_TICKS_PASSED(SDL_GetTicks(), qtWindowHideDeadline)) {
+            m_QtWindow->setVisible(false);
+            qtWindowHideDeadline = 0;
+        }
+    };
+
     SDL_Event event;
     for (;;) {
+        hideGuiWindowWhenSettled(false);
         processSunshineAbrFeedback();
+#ifdef Q_OS_WIN32
+        processClientSdrWhiteUpdate();
+#endif
+        processFileMappingUxProbeResult();
+        processFileMappingMountResult();
+        processClipboardHelperMessages();
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+        if (m_StylusReplayTest) {
+            m_StylusReplayTest->process();
+        }
+#endif
 
 #if SDL_VERSION_ATLEAST(2, 0, 18) && !defined(STEAM_LINK)
         // SDL 2.0.18 has a proper wait event implementation that uses platform
@@ -2938,8 +5028,29 @@ void Session::exec()
         // NB: This behavior was introduced in SDL 2.0.16, but had a few critical
         // issues that could cause indefinite timeouts, delayed joystick detection,
         // and other problems.
-        if (!SDL_WaitEventTimeout(&event, 1000)) {
+        int waitTimeoutMs = (m_ClipboardHelper != nullptr && m_ClipboardHelper->isRunning()) ? 100 : 1000;
+        if (qtUiNeedsEventProcessing()) {
+            waitTimeoutMs = qMin(waitTimeoutMs, static_cast<int>(QT_UI_EVENT_PUMP_INTERVAL_MS));
+        }
+        if (const int toastDelayMs = m_Toast ? m_Toast->nextEventDelayMs() : -1;
+                toastDelayMs >= 0) {
+            // Avoid relying on platform-specific zero-timeout behavior. Once
+            // due, a 1 ms wake is sufficient and prevents a busy loop if the
+            // native dispatcher needs one more turn to deliver the update.
+            waitTimeoutMs = qMin(waitTimeoutMs, qMax(toastDelayMs, 1));
+        }
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+        if (const int replayDelayMs = m_StylusReplayTest ?
+                    m_StylusReplayTest->nextDelayMs() : -1;
+                replayDelayMs >= 0) {
+            waitTimeoutMs = qMin(waitTimeoutMs, replayDelayMs);
+        }
+#endif
+        if (!SDL_WaitEventTimeout(&event, waitTimeoutMs)) {
             presence.runCallbacks();
+            processClipboardHelperMessages();
+            processFileMappingUxProbeResult();
+            processFileMappingMountResult();
             processQtEventsDuringStream(true);
             processSunshineAbrFeedback();
             continue;
@@ -2958,10 +5069,18 @@ void Session::exec()
             SDL_Delay(10);
 #endif
             presence.runCallbacks();
+            processClipboardHelperMessages();
+            processFileMappingUxProbeResult();
+            processFileMappingMountResult();
             processQtEventsDuringStream();
             processSunshineAbrFeedback();
             continue;
         }
+#endif
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+        // Developer-only replay isolation state, evaluated once per SDL event.
+        const bool filterLocalMouseForStylusReplay = m_StylusReplayTest &&
+                m_StylusReplayTest->shouldFilterLocalMouseInput();
 #endif
         switch (event.type) {
         case SDL_QUIT:
@@ -2969,6 +5088,13 @@ void Session::exec()
             // (rather than a user-initiated quit), try to silently reconnect
             // before tearing the session down.
             if (m_ConnectionInterrupted && !m_ShouldExit) {
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+                // A replay timeline belongs to one protocol connection. Do not
+                // resume overdue samples against a newly established session.
+                if (m_StylusReplayTest) {
+                    m_StylusReplayTest->stop(false);
+                }
+#endif
                 m_ConnectionInterrupted = false;
                 if (tryReconnect()) {
                     // Streaming resumed; keep running the event loop
@@ -2987,43 +5113,7 @@ void Session::exec()
             goto DispatchDeferredCleanup;
 
         case SDL_USEREVENT:
-            switch (event.user.code) {
-            case SDL_CODE_FRAME_READY:
-                if (m_VideoDecoder != nullptr) {
-                    m_VideoDecoder->renderFrameOnMainThread();
-                }
-                break;
-            case SDL_CODE_FLUSH_WINDOW_EVENT_BARRIER:
-                m_FlushingWindowEventsRef--;
-                break;
-            case SDL_CODE_GAMECONTROLLER_RUMBLE:
-                m_InputHandler->rumble((uint16_t)(uintptr_t)event.user.data1,
-                                       (uint16_t)((uintptr_t)event.user.data2 >> 16),
-                                       (uint16_t)((uintptr_t)event.user.data2 & 0xFFFF));
-                break;
-            case SDL_CODE_GAMECONTROLLER_RUMBLE_TRIGGERS:
-                m_InputHandler->rumbleTriggers((uint16_t)(uintptr_t)event.user.data1,
-                                               (uint16_t)((uintptr_t)event.user.data2 >> 16),
-                                               (uint16_t)((uintptr_t)event.user.data2 & 0xFFFF));
-                break;
-            case SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE:
-                m_InputHandler->setMotionEventState((uint16_t)(uintptr_t)event.user.data1,
-                                                    (uint8_t)((uintptr_t)event.user.data2 >> 16),
-                                                    (uint16_t)((uintptr_t)event.user.data2 & 0xFFFF));
-                break;
-            case SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED:
-                m_InputHandler->setControllerLED((uint16_t)(uintptr_t)event.user.data1,
-                                                 (uint8_t)((uintptr_t)event.user.data2 >> 16),
-                                                 (uint8_t)((uintptr_t)event.user.data2 >> 8),
-                                                 (uint8_t)((uintptr_t)event.user.data2));
-                break;
-            case SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS:
-                m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
-                                                    (DualSenseOutputReport *)event.user.data2);
-                break;
-            default:
-                SDL_assert(false);
-            }
+            handleSdlUserEvent(event.user);
             break;
 
         case SDL_WINDOWEVENT:
@@ -3048,14 +5138,20 @@ void Session::exec()
             case SDL_WINDOWEVENT_LEAVE:
                 m_InputHandler->notifyMouseLeave();
                 break;
+            case SDL_WINDOWEVENT_HIDDEN:
+            case SDL_WINDOWEVENT_MINIMIZED:
+            case SDL_WINDOWEVENT_RESTORED:
+            case SDL_WINDOWEVENT_SHOWN:
+            case SDL_WINDOWEVENT_MOVED:
             case SDL_WINDOWEVENT_SIZE_CHANGED:
-                // Reposition floating menu button if visible
-                if (m_MenuButton && m_MenuButton->isButtonVisible()) {
-                    int wx, wy, ww, wh;
-                    SDL_GetWindowPosition(m_Window, &wx, &wy);
-                    SDL_GetWindowSize(m_Window, &ww, &wh);
-                    m_MenuButton->repositionTo(wx, wy, ww, wh);
-                }
+                // Cocoa 在全屏切换结束之后才发这个事件，拿它当「窗口已落定」的信号
+                hideGuiWindowWhenSettled(true);
+                syncQtOverlayWindowsWithSdlWindowState();
+                // 远端光标的尺寸是按窗口的 backing 比例算的（见 getRemoteCursorScale()），
+                // 换屏、改分辨率、改缩放都会让它失效。挂在这一组事件上而不是只挂
+                // DISPLAY_CHANGED：同一块屏上改系统缩放只会发 SIZE_CHANGED。
+                // 比例没变时这个调用会直接返回，挂宽一点不亏。
+                m_InputHandler->refreshRemoteCursorScale();
                 break;
             }
 
@@ -3207,6 +5303,7 @@ void Session::exec()
                 // Choose a new decoder (hopefully the same one, but possibly
                 // not if a GPU was removed or something).
                 if (!chooseDecoder(m_Preferences->videoDecoderSelection,
+                                   m_Preferences->rendererSelection,
                                    m_Window, m_ActiveVideoFormat, m_ActiveVideoWidth,
                                    m_ActiveVideoHeight, m_ActiveVideoFrameRate,
                                    enableVsync,
@@ -3221,6 +5318,16 @@ void Session::exec()
                     emit displayLaunchError(tr("Unable to initialize video decoder. Please check your streaming settings and try again."));
                     goto DispatchDeferredCleanup;
                 }
+
+                // SDL_CreateRenderer() may recreate the platform window while
+                // retaining the SDL_Window object. Refresh native input hooks
+                // after renderer creation so they follow the replacement window.
+                m_InputHandler->setWindow(m_Window);
+#ifdef Q_OS_DARWIN
+                if (m_MacQtEventPumpInputGuard) {
+                    m_MacQtEventPumpInputGuard->setStreamingWindow(m_Window);
+                }
+#endif
 
                 // As of SDL 2.0.12, SDL_RecreateWindow() doesn't carry over mouse capture
                 // or mouse hiding state to the new window. By capturing after the decoder
@@ -3247,6 +5354,15 @@ void Session::exec()
         case SDL_KEYUP:
         case SDL_KEYDOWN:
             presence.runCallbacks();
+            // Escape follows the same back/close rule as the controller. Swallow
+            // both halves of the key press so it cannot reach the remote app.
+            if (m_MenuPanel && (m_MenuPanel->isMenuVisible() || m_MenuPanel->isClosing()) &&
+                event.key.keysym.sym == SDLK_ESCAPE) {
+                if (event.type == SDL_KEYUP && m_MenuPanel->isMenuVisible()) {
+                    m_MenuPanel->gamepadBack();
+                }
+                break;
+            }
             // Ctrl+Alt+Shift+O toggles the Qt overlay menu
             if (event.key.state == SDL_PRESSED &&
                 (event.key.keysym.mod & KMOD_CTRL) &&
@@ -3263,9 +5379,21 @@ void Session::exec()
         {
             presence.runCallbacks();
 
-            // When Qt overlay menu is visible, consume all button events
-            // to prevent SDL from re-capturing the mouse
-            if (m_MenuPanel && m_MenuPanel->isMenuVisible()) {
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+            // Developer-only replay isolation. The .dat format contains only
+            // pen samples; this option suppresses concurrent local SDL mouse
+            // input so it cannot alter the remote result under test.
+            if (filterLocalMouseForStylusReplay) {
+                break;
+            }
+#endif
+
+            // Dismiss on release so the entire outside click stays local;
+            // neither a press nor an unmatched release reaches the host.
+            if (m_MenuPanel && (m_MenuPanel->isMenuVisible() || m_MenuPanel->isClosing())) {
+                if (event.type == SDL_MOUSEBUTTONUP) {
+                    m_MenuPanel->dismissOnOutsideClick(QCursor::pos());
+                }
                 break;
             }
 
@@ -3274,9 +5402,16 @@ void Session::exec()
         }
         case SDL_MOUSEMOTION:
         {
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+            if (filterLocalMouseForStylusReplay) {
+                break;
+            }
+#endif
             // Qt overlay menu: edge detection with debounce (500ms cooldown after close)
-            // Only trigger for edge-based positions (not disabled, at-cursor, or button)
-            if (m_MenuPanel && !m_MenuPanel->isMenuVisible() &&
+            // Disabled and button modes do not perform per-motion edge checks.
+            if (m_MenuPanel &&
+                !m_MenuPanel->isMenuVisible() &&
+                !m_MenuPanel->isClosing() &&
                 m_Preferences->overlayMenuPosition != StreamingPreferences::OMP_DISABLED &&
                 m_Preferences->overlayMenuPosition != StreamingPreferences::OMP_BUTTON) {
                 Uint32 elapsed = SDL_GetTicks() - m_MenuCloseTicks;
@@ -3284,14 +5419,23 @@ void Session::exec()
                     int ww, wh;
                     SDL_GetWindowSize(m_Window, &ww, &wh);
                     bool atEdge = false;
-                    if (m_Preferences->overlayMenuPosition == StreamingPreferences::OMP_LEFT_EDGE) {
+                    switch (m_Preferences->overlayMenuPosition) {
+                    case StreamingPreferences::OMP_LEFT_EDGE:
                         atEdge = (event.motion.x <= 5);
-                    } else {
-                        // OMP_RIGHT_EDGE (default)
+                        break;
+                    case StreamingPreferences::OMP_TOP_EDGE:
+                        atEdge = (event.motion.y <= 5);
+                        break;
+                    case StreamingPreferences::OMP_DISABLED:
+                    case StreamingPreferences::OMP_BUTTON:
+                        break;
+                    case StreamingPreferences::OMP_RIGHT_EDGE:
+                    default:
                         atEdge = (event.motion.x >= ww - 5);
+                        break;
                     }
                     if (atEdge) {
-                        showQtOverlayMenu();
+                        showQtOverlayMenu(QCursor::pos());
                         break;
                     }
                 }
@@ -3306,6 +5450,11 @@ void Session::exec()
             break;
         }
         case SDL_MOUSEWHEEL:
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+            if (filterLocalMouseForStylusReplay) {
+                break;
+            }
+#endif
             m_InputHandler->handleMouseWheelEvent(&event.wheel);
             break;
         case SDL_CONTROLLERAXISMOTION:
@@ -3327,6 +5476,12 @@ void Session::exec()
                         break;
                     case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
                         m_MenuPanel->gamepadMoveDown();
+                        break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+                        m_MenuPanel->gamepadAdjustSlider(-1);
+                        break;
+                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+                        m_MenuPanel->gamepadAdjustSlider(1);
                         break;
                     case SDL_CONTROLLER_BUTTON_A:
                         m_MenuPanel->gamepadSelect();
@@ -3361,6 +5516,7 @@ void Session::exec()
         case SDL_CONTROLLERDEVICEADDED:
         case SDL_CONTROLLERDEVICEREMOVED:
             m_InputHandler->handleControllerDeviceEvent(&event.cdevice);
+            updateDualSenseHapticsControllerTarget();
             break;
         case SDL_JOYDEVICEADDED:
             m_InputHandler->handleJoystickArrivalEvent(&event.jdevice);
@@ -3380,7 +5536,15 @@ void Session::exec()
             break;
         }
 
+        processClipboardHelperMessages();
+        processFileMappingUxProbeResult();
+        processFileMappingMountResult();
         processQtEventsDuringStream();
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+        if (m_StylusReplayTest) {
+            m_StylusReplayTest->process();
+        }
+#endif
 
         // Deferred microphone toggle — runs outside processEvents() to avoid
         // heap corruption when creating QAudioSource within nested event loops
@@ -3406,6 +5570,18 @@ DispatchDeferredCleanup:
     // Switch back to synchronous logging mode
     StreamUtils::exitAsyncLoggingMode();
 
+    if (m_ClipboardHelper != nullptr) {
+        m_ClipboardHelper->processPendingMessages();
+        stopClipboardHelper();
+    }
+
+#ifdef MOONLIGHT_ENABLE_FUNCTION_TESTS
+    m_WasCapturedBeforeStylusReplayPanel = false;
+    m_StylusReplayTest.reset();
+#endif
+
+    cleanupFileMappingMount();
+
     // Destroy the Qt overlay menu panel
     if (m_MenuPanel) {
         m_MenuPanel->closeMenu();
@@ -3416,16 +5592,23 @@ DispatchDeferredCleanup:
     // Destroy the Qt overlay menu button
     if (m_MenuButton) {
         m_MenuButton->hideButton();
+#if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || \
+        defined(HAVE_LINUX_DISPLAY_EVENT_MONITOR)
+        m_MenuButton->setEventWakeCallback({});
+#endif
         delete m_MenuButton;
         m_MenuButton = nullptr;
     }
 
     // Destroy the Qt overlay toast
     if (m_Toast) {
-        m_Toast->close();
+        m_Toast->dismissImmediately();
         delete m_Toast;
         m_Toast = nullptr;
     }
+#ifdef Q_OS_DARWIN
+    m_MacQtEventPumpInputGuard.reset();
+#endif
 
     // Uncapture the mouse and hide the window immediately,
     // so we can return to the Qt GUI ASAP.
@@ -3442,6 +5625,10 @@ DispatchDeferredCleanup:
     // Destroy the input handler now. This must be destroyed
     // before allowwing the UI to continue execution or it could
     // interfere with SDLGamepadKeyNavigation.
+    if (m_DualSenseHapticsRenderer != nullptr) {
+        m_DualSenseHapticsRenderer->setControllerTarget(-1);
+    }
+    stopControllerRumbleAtConnectionBoundary(m_InputHandler);
     delete m_InputHandler;
     m_InputHandler = nullptr;
 
@@ -3488,6 +5675,8 @@ DispatchDeferredCleanup:
     }
 
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    // Release the forwarded USB device with the stream.
+    teardownUsbTunnel();
 
     // Cleanup can take a while, so dispatch it to a worker thread.
     // When it is complete, it will release our s_ActiveSessionSemaphore

@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QRect>
 #include <QQmlEngine>
+#include <QString>
 
 class StreamingPreferences : public QObject
 {
@@ -45,6 +46,17 @@ public:
     };
     Q_ENUM(VideoDecoderSelection)
 
+    // Mac only (for now)
+    enum RendererSelection
+    {
+        RS_PROBE_ONLY = -1, // Only valid for probing decoder properties
+        RS_AUTO,
+        RS_VULKAN,
+        RS_METAL,
+        RS_AVSBDL
+    };
+    Q_ENUM(RendererSelection)
+
     enum WindowMode
     {
         WM_FULLSCREEN,
@@ -60,6 +72,16 @@ public:
         UI_FULLSCREEN
     };
     Q_ENUM(UIDisplayMode)
+
+    enum BackgroundSource
+    {
+        BGS_PHOTOGRAPHY,
+        BGS_ANIME,
+        BGS_API,
+        BGS_LOCAL,
+        BGS_NONE,
+    };
+    Q_ENUM(BackgroundSource)
 
     // New entries must go at the end of the enum
     // to avoid renumbering existing entries (which
@@ -111,12 +133,27 @@ public:
 
     enum OverlayMenuPosition
     {
-        OMP_RIGHT_EDGE = 0,  // Default: show on right edge of streaming window
-        OMP_LEFT_EDGE  = 1,  // Show on left edge
-        OMP_DISABLED   = 3,  // Do not show overlay menu (keep old value for compat)
-        OMP_BUTTON     = 4,  // Show a floating button on the streaming window
+        OMP_DISABLED = 0,   // Do not show the overlay menu
+        OMP_BUTTON = 1,     // Show a floating button on the streaming window
+        OMP_TOP_EDGE = 2,   // Show from the top edge of the streaming window
+        OMP_RIGHT_EDGE = 3, // Show on right edge
+        OMP_LEFT_EDGE = 4,  // Show on left edge
     };
     Q_ENUM(OverlayMenuPosition);
+
+    void setOverlayMenuPosition(OverlayMenuPosition position);
+
+    BackgroundSource backgroundSource() const;
+    void setBackgroundSource(BackgroundSource source);
+    QString backgroundImageApi() const;
+    void setBackgroundImageApi(const QString &apiUrl);
+    QString backgroundImageLocalPath() const;
+    void setBackgroundImageLocalPath(const QString &path);
+    int backgroundOverlayOpacity() const;
+    void setBackgroundOverlayOpacity(int opacity);
+    bool backgroundSetupCompleted() const;
+    void setBackgroundSetupCompleted(bool completed);
+    Q_INVOKABLE void resetBackgroundConfiguration();
 
     enum HdrMode
     {
@@ -125,17 +162,44 @@ public:
     };
     Q_ENUM(HdrMode);
 
+    enum HdrBrightnessMode
+    {
+        HBM_HOST_DEFAULT = 0,
+        HBM_AUTO = 1,
+        HBM_MANUAL = 2,
+    };
+    Q_ENUM(HdrBrightnessMode);
+
+    enum DualSenseHapticsMode
+    {
+        DSHM_PHYSICAL = 0,
+        DSHM_EMULATED = 1,
+    };
+    Q_ENUM(DualSenseHapticsMode);
+
     enum GamepadQuitCombo
     {
-        GQC_DEFAULT         = 0,  // Start + Select + L1 + R1 (original)
-        GQC_SELECT_L1_R1_X  = 1,  // Select + L1 + R1 + X (avoids Start+Select conflict)
-        GQC_SELECT_L1_R1_Y  = 2,  // Select + L1 + R1 + Y
-        GQC_START_L1_R1_A   = 3,  // Start + L1 + R1 + A (avoids Select conflict)
-        GQC_START_L1_R1_B   = 4,  // Start + L1 + R1 + B (avoids Select conflict)
-        GQC_L1_R1_X_Y       = 5,  // L1 + R1 + X + Y (no Select/Start at all)
-        GQC_L1_R1_A_B       = 6,  // L1 + R1 + A + B (no Select/Start at all)
+        GQC_DEFAULT = 0,        // Start + Select + L1 + R1 (original)
+        GQC_SELECT_L1_R1_X = 1, // Deprecated: same combo as the stats overlay toggle; migrated to
+                                // GQC_SELECT_L1_R1_Y on load
+        GQC_SELECT_L1_R1_Y = 2, // Select + L1 + R1 + Y
+        GQC_START_L1_R1_A = 3,  // Start + L1 + R1 + A (avoids Select conflict)
+        GQC_START_L1_R1_B = 4,  // Start + L1 + R1 + B (avoids Select conflict)
+        GQC_L1_R1_X_Y = 5,      // L1 + R1 + X + Y (no Select/Start at all)
+        GQC_L1_R1_A_B = 6,      // L1 + R1 + A + B (no Select/Start at all)
     };
     Q_ENUM(GamepadQuitCombo);
+
+    enum ScreenCombinationMode
+    {
+        SCM_FOLLOW_HOST = -1,
+        SCM_NO_OPERATION = 0,
+        SCM_ENSURE_ACTIVE = 1,
+        SCM_ENSURE_PRIMARY = 2,
+        SCM_ENSURE_ONLY_DISPLAY = 3,
+        SCM_ENSURE_SECONDARY = 4,
+    };
+    Q_ENUM(ScreenCombinationMode);
 
     Q_PROPERTY(int width MEMBER width NOTIFY displayModeChanged)
     Q_PROPERTY(int height MEMBER height NOTIFY displayModeChanged)
@@ -153,6 +217,8 @@ public:
     Q_PROPERTY(bool absoluteMouseMode MEMBER absoluteMouseMode NOTIFY absoluteMouseModeChanged)
     Q_PROPERTY(bool showLocalCursor MEMBER showLocalCursor NOTIFY showLocalCursorChanged)
     Q_PROPERTY(bool absoluteTouchMode MEMBER absoluteTouchMode NOTIFY absoluteTouchModeChanged)
+    Q_PROPERTY(bool enableNativeTouchpad MEMBER enableNativeTouchpad NOTIFY enableNativeTouchpadChanged)
+    Q_PROPERTY(DualSenseHapticsMode dualSenseHapticsMode MEMBER dualSenseHapticsMode NOTIFY dualSenseHapticsModeChanged)
     Q_PROPERTY(bool framePacing MEMBER framePacing NOTIFY framePacingChanged)
     Q_PROPERTY(bool videoEnhancement MEMBER videoEnhancement NOTIFY videoEnhancementChanged)
     Q_PROPERTY(bool streamResolutionScale MEMBER streamResolutionScale NOTIFY streamResolutionScaleChanged)
@@ -166,17 +232,29 @@ public:
     Q_PROPERTY(bool configurationWarnings MEMBER configurationWarnings NOTIFY configurationWarningsChanged)
     Q_PROPERTY(bool richPresence MEMBER richPresence NOTIFY richPresenceChanged)
     Q_PROPERTY(bool gamepadMouse MEMBER gamepadMouse NOTIFY gamepadMouseChanged)
+    Q_PROPERTY(int gamepadDeadzone MEMBER gamepadDeadzone NOTIFY gamepadDeadzoneChanged)
     Q_PROPERTY(bool detectNetworkBlocking MEMBER detectNetworkBlocking NOTIFY detectNetworkBlockingChanged)
     Q_PROPERTY(bool showPerformanceOverlay MEMBER showPerformanceOverlay NOTIFY showPerformanceOverlayChanged)
     Q_PROPERTY(AudioConfig audioConfig MEMBER audioConfig NOTIFY audioConfigChanged)
     Q_PROPERTY(VideoCodecConfig videoCodecConfig MEMBER videoCodecConfig NOTIFY videoCodecConfigChanged)
     Q_PROPERTY(bool enableHdr MEMBER enableHdr NOTIFY enableHdrChanged)
     Q_PROPERTY(HdrMode hdrMode MEMBER hdrMode NOTIFY hdrModeChanged)
+    Q_PROPERTY(HdrBrightnessMode hdrBrightnessMode MEMBER hdrBrightnessMode NOTIFY hdrBrightnessModeChanged)
+    Q_PROPERTY(double hdrMaxBrightness MEMBER hdrMaxBrightness NOTIFY hdrBrightnessValuesChanged)
+    Q_PROPERTY(double hdrMinBrightness MEMBER hdrMinBrightness NOTIFY hdrBrightnessValuesChanged)
+    Q_PROPERTY(double hdrMaxAverageBrightness MEMBER hdrMaxAverageBrightness NOTIFY hdrBrightnessValuesChanged)
     Q_PROPERTY(bool enableYUV444 MEMBER enableYUV444 NOTIFY enableYUV444Changed)
     Q_PROPERTY(VideoDecoderSelection videoDecoderSelection MEMBER videoDecoderSelection NOTIFY videoDecoderSelectionChanged)
+    Q_PROPERTY(RendererSelection rendererSelection MEMBER rendererSelection NOTIFY rendererSelectionChanged)
     Q_PROPERTY(WindowMode windowMode MEMBER windowMode NOTIFY windowModeChanged)
     Q_PROPERTY(WindowMode recommendedFullScreenMode MEMBER recommendedFullScreenMode CONSTANT)
     Q_PROPERTY(UIDisplayMode uiDisplayMode MEMBER uiDisplayMode NOTIFY uiDisplayModeChanged)
+    Q_PROPERTY(bool rememberWindowPosition MEMBER rememberWindowPosition NOTIFY rememberWindowPositionChanged)
+    Q_PROPERTY(BackgroundSource backgroundSource READ backgroundSource WRITE setBackgroundSource NOTIFY backgroundConfigurationChanged)
+    Q_PROPERTY(QString backgroundImageApi READ backgroundImageApi WRITE setBackgroundImageApi NOTIFY backgroundConfigurationChanged)
+    Q_PROPERTY(QString backgroundImageLocalPath READ backgroundImageLocalPath WRITE setBackgroundImageLocalPath NOTIFY backgroundConfigurationChanged)
+    Q_PROPERTY(int backgroundOverlayOpacity READ backgroundOverlayOpacity WRITE setBackgroundOverlayOpacity NOTIFY backgroundOverlayOpacityChanged)
+    Q_PROPERTY(bool backgroundSetupCompleted READ backgroundSetupCompleted WRITE setBackgroundSetupCompleted NOTIFY backgroundSetupCompletedChanged)
     Q_PROPERTY(bool swapMouseButtons MEMBER swapMouseButtons NOTIFY mouseButtonsChanged)
     Q_PROPERTY(bool swapWinAltKeys MEMBER swapWinAltKeys NOTIFY swapWinAltKeysChanged)
     Q_PROPERTY(bool muteOnFocusLoss MEMBER muteOnFocusLoss NOTIFY muteOnFocusLossChanged)
@@ -187,13 +265,17 @@ public:
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged)
-    Q_PROPERTY(int customScreenMode MEMBER customScreenMode NOTIFY customScreenModeChanged)
-    Q_PROPERTY(int customVddScreenMode MEMBER customVddScreenMode NOTIFY customVddScreenModeChanged)
+    Q_PROPERTY(ScreenCombinationMode screenCombinationMode MEMBER screenCombinationMode NOTIFY screenCombinationModeChanged)
     Q_PROPERTY(bool enableMicrophone MEMBER enableMicrophone NOTIFY enableMicrophoneChanged)
     Q_PROPERTY(OverlayMenuPosition overlayMenuPosition MEMBER overlayMenuPosition NOTIFY overlayMenuPositionChanged)
     Q_PROPERTY(bool autoUpdateCheck MEMBER autoUpdateCheck NOTIFY autoUpdateCheckChanged)
+    Q_PROPERTY(bool usbForwardingEnabled MEMBER usbForwardingEnabled NOTIFY usbForwardingEnabledChanged)
+    Q_PROPERTY(QStringList usbForwardingBoundDevices READ usbForwardingBoundDevices WRITE setUsbForwardingBoundDevices NOTIFY usbForwardingBoundDevicesChanged)
 
     Q_INVOKABLE bool retranslate();
+
+    QStringList usbForwardingBoundDevices() const { return m_UsbForwardingBoundDevices; }
+    void setUsbForwardingBoundDevices(const QStringList& devices);
 
     // Directly accessible members for preferences
     int width;
@@ -212,6 +294,8 @@ public:
     bool absoluteMouseMode;
     bool showLocalCursor;
     bool absoluteTouchMode;
+    bool enableNativeTouchpad;
+    DualSenseHapticsMode dualSenseHapticsMode;
     bool framePacing;
     bool videoEnhancement;
     bool streamResolutionScale;
@@ -232,6 +316,9 @@ public:
     bool muteOnFocusLoss;
     bool backgroundGamepad;
     GamepadQuitCombo gamepadQuitCombo;
+
+    // Stick deadzone in percent (0-30); 0 passes stick input through unmodified
+    int gamepadDeadzone;
     bool reverseScrollDirection;
     bool swapFaceButtons;
     bool keepAwake;
@@ -240,18 +327,24 @@ public:
     VideoCodecConfig videoCodecConfig;
     bool enableHdr;
     HdrMode hdrMode;
+    HdrBrightnessMode hdrBrightnessMode;
+    double hdrMaxBrightness;
+    double hdrMinBrightness;
+    double hdrMaxAverageBrightness;
     bool enableYUV444;
     VideoDecoderSelection videoDecoderSelection;
     WindowMode windowMode;
     WindowMode recommendedFullScreenMode;
     UIDisplayMode uiDisplayMode;
+    bool rememberWindowPosition;
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
-    int customScreenMode;
-    int customVddScreenMode;
+    ScreenCombinationMode screenCombinationMode;
     bool enableMicrophone;
     OverlayMenuPosition overlayMenuPosition;
     bool autoUpdateCheck;
+    bool usbForwardingEnabled;
+    RendererSelection rendererSelection;
 
 signals:
     void displayModeChanged();
@@ -269,13 +362,21 @@ signals:
     void absoluteMouseModeChanged();
     void showLocalCursorChanged();
     void absoluteTouchModeChanged();
+    void enableNativeTouchpadChanged();
+    void dualSenseHapticsModeChanged();
     void audioConfigChanged();
     void videoCodecConfigChanged();
     void enableHdrChanged();
     void hdrModeChanged();
+    void hdrBrightnessModeChanged();
+    void hdrBrightnessValuesChanged();
     void enableYUV444Changed();
     void videoDecoderSelectionChanged();
     void uiDisplayModeChanged();
+    void rememberWindowPositionChanged();
+    void backgroundConfigurationChanged();
+    void backgroundOverlayOpacityChanged();
+    void backgroundSetupCompletedChanged();
     void windowModeChanged();
     void framePacingChanged();
     void videoEnhancementChanged();
@@ -297,21 +398,32 @@ signals:
     void muteOnFocusLossChanged();
     void backgroundGamepadChanged();
     void gamepadQuitComboChanged();
+    void gamepadDeadzoneChanged();
     void reverseScrollDirectionChanged();
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
     void keepAwakeChanged();
     void languageChanged();
-    void customScreenModeChanged();
-    void customVddScreenModeChanged();
+    void screenCombinationModeChanged();
     void enableMicrophoneChanged();
     void overlayMenuPositionChanged();
     void autoUpdateCheckChanged();
+    void usbForwardingEnabledChanged();
+    void usbForwardingBoundDevicesChanged();
+    void rendererSelectionChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);
 
     QString getSuffixFromLanguage(Language lang);
+
+    QStringList m_UsbForwardingBoundDevices;
+
+    BackgroundSource m_BackgroundSource;
+    QString m_BackgroundImageApi;
+    QString m_BackgroundImageLocalPath;
+    int m_BackgroundOverlayOpacity;
+    bool m_BackgroundSetupCompleted;
 
     QQmlEngine* m_QmlEngine;
 };

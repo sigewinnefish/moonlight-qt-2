@@ -11,6 +11,7 @@
 #include <QNetworkReply>
 #include <QSysInfo>
 #include <QTextStream>
+#include <QTimer>
 
 // GitHub repository for update checks
 #define GITHUB_OWNER "qiin2333"
@@ -49,17 +50,40 @@ bool AutoUpdateChecker::supportsInAppUpdate() const
     return m_PortableUpdateInstaller->supportsInAppUpdate();
 }
 
+bool AutoUpdateChecker::supportsUpdateCheck() const
+{
+#if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || defined(STEAM_LINK) || defined(APP_IMAGE)
+    return true;
+#else
+    return false;
+#endif
+}
+
 void AutoUpdateChecker::installUpdate(QString url)
 {
-    m_PortableUpdateInstaller->installUpdate(url);
+    const QString expectedDigest = url == m_UpdateDownloadUrl ? m_UpdateAssetDigest : QString();
+    m_PortableUpdateInstaller->installUpdate(url, expectedDigest);
 }
 
 void AutoUpdateChecker::start()
 {
-    if (!m_Nam) {
-        Q_ASSERT(m_Nam);
-        return;
+    checkForUpdates();
+}
+
+bool AutoUpdateChecker::checkForUpdates()
+{
+    if (!supportsUpdateCheck()) {
+        return false;
     }
+
+    if (m_UpdateCheckInProgress) {
+        // The automatic startup check may still be running. Do not let a
+        // newly opened settings page wait for a signal it cannot observe.
+        return false;
+    }
+
+    m_UpdateCheckInProgress = true;
+    emit onUpdateCheckStarted();
 
 #if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN) || defined(STEAM_LINK) || defined(APP_IMAGE)
 #if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0) && QT_VERSION < QT_VERSION_CHECK(5, 15, 1) && !defined(QT_NO_BEARERMANAGEMENT)
@@ -75,6 +99,12 @@ void AutoUpdateChecker::start()
                  .arg(GITHUB_OWNER, GITHUB_REPO));
     QNetworkRequest request(url);
 
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    // Keep a manual check from leaving its button busy forever when the
+    // network is unavailable but the connection never closes.
+    request.setTransferTimeout(15000);
+#endif
+
     // GitHub API requires a User-Agent header
     request.setHeader(QNetworkRequest::UserAgentHeader,
                       QString("Moonlight/%1").arg(VERSION_STR));
@@ -86,8 +116,30 @@ void AutoUpdateChecker::start()
 #else
     request.setAttribute(QNetworkRequest::HTTP2AllowedAttribute, true);
 #endif
-    m_Nam->get(request);
+    QNetworkReply* reply = m_Nam->get(request);
+    // Some macOS network paths can remain in DNS/connect state without
+    // honoring QNetworkRequest::setTransferTimeout(). Abort explicitly so
+    // the UI always receives a terminal result. Parent the timer to the
+    // reply so it cannot outlive the request or touch a deleted reply.
+    QTimer* timeout = new QTimer(reply);
+    timeout->setSingleShot(true);
+    connect(reply, &QNetworkReply::finished, timeout, &QTimer::stop);
+    connect(timeout, &QTimer::timeout, this, [this, reply]() {
+        if (!reply->isRunning()) {
+            return;
+        }
+
+        qWarning() << "Update check timed out";
+        reply->abort();
+        if (m_UpdateCheckInProgress) {
+            m_UpdateCheckInProgress = false;
+            emit onUpdateCheckFailed();
+        }
+    });
+    timeout->start(15000);
 #endif
+
+    return true;
 }
 
 void AutoUpdateChecker::parseStringToVersionQuad(const QString& string, QVector<int>& version)
@@ -123,6 +175,28 @@ void AutoUpdateChecker::parseStringToVersionQuad(const QString& string, QVector<
     }
 }
 
+QString AutoUpdateChecker::getPreferredAssetSuffix() const
+{
+#if defined(Q_OS_DARWIN)
+    // CI 出的 DMG 现在带架构后缀（Moonlight-<版本>-arm64.dmg）。
+    // QSysInfo::buildCpuArchitecture() 给的是 arm64 / x86_64，和 generate-dmg.sh
+    // 里的 MOONLIGHT_ARCH 用词一致。
+    //
+    // 只是「优先」而不是「必须」：这个后缀是从某个版本才开始有的，旧 release 里是
+    // Moonlight-<版本>.dmg。匹配不到就退回任意 .dmg，否则老版本的用户会看到
+    // 「找不到更新包」。
+    return QStringLiteral("-") + QSysInfo::buildCpuArchitecture() + QStringLiteral(".dmg");
+#elif defined(APP_IMAGE)
+    QString architecture = QSysInfo::buildCpuArchitecture().toLower();
+    if (architecture == QStringLiteral("arm64")) {
+        architecture = QStringLiteral("aarch64");
+    }
+    return QStringLiteral("-") + architecture + QStringLiteral(".AppImage");
+#else
+    return QString();
+#endif
+}
+
 QString AutoUpdateChecker::getExpectedAssetSuffix() const
 {
 #if defined(Q_OS_WIN32)
@@ -149,10 +223,10 @@ QString AutoUpdateChecker::getExpectedAssetPrefix() const
 {
 #if defined(Q_OS_WIN32)
     if (isPortableInstall()) {
-        return QStringLiteral("MoonlightPortable-%1-").arg(getCurrentBuildArch());
+        return QStringLiteral("Moonlight-VPlus-Portable-%1-").arg(getCurrentBuildArch());
     }
 
-    return QStringLiteral("MoonlightSetup-");
+    return QStringLiteral("Moonlight-VPlus-Setup-");
 #else
     return QString();
 #endif
@@ -202,10 +276,14 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
 {
     Q_ASSERT(reply->isFinished());
 
-    // Delete the QNetworkAccessManager to free resources and
-    // prevent the bearer plugin from polling in the background.
-    m_Nam->deleteLater();
-    m_Nam = nullptr;
+    auto finish = [this](bool updateAvailable) {
+        m_UpdateCheckInProgress = false;
+        emit onUpdateCheckFinished(updateAvailable);
+    };
+    auto fail = [this]() {
+        m_UpdateCheckInProgress = false;
+        emit onUpdateCheckFailed();
+    };
 
     if (reply->error() == QNetworkReply::NoError) {
         QTextStream stream(reply);
@@ -224,11 +302,13 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
         QJsonDocument jsonDoc = QJsonDocument::fromJson(jsonString.toUtf8(), &error);
         if (jsonDoc.isNull()) {
             qWarning() << "GitHub release response malformed:" << error.errorString();
+            fail();
             return;
         }
 
         if (!jsonDoc.isObject()) {
             qWarning() << "GitHub release response is not a JSON object";
+            fail();
             return;
         }
 
@@ -252,11 +332,13 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
         // Skip pre-releases and drafts
         if (releaseObj["prerelease"].toBool(false) || releaseObj["draft"].toBool(false)) {
             qDebug() << "Latest GitHub release is a pre-release or draft, skipping";
+            finish(false);
             return;
         }
 
         if (!releaseObj.contains("tag_name") || !releaseObj["tag_name"].isString()) {
             qWarning() << "GitHub release missing tag_name";
+            fail();
             return;
         }
 
@@ -267,6 +349,12 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
         QVector<int> latestVersionQuad;
         parseStringToVersionQuad(tagName, latestVersionQuad);
 
+        if (latestVersionQuad.isEmpty()) {
+            qWarning() << "GitHub release contains an invalid tag_name:" << tagName;
+            fail();
+            return;
+        }
+
         int res = compareVersion(m_CurrentVersionQuad, latestVersionQuad);
         if (res < 0) {
             // Current version is older than latest release
@@ -274,25 +362,72 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
 
             // Try to find a platform-specific download URL from assets
             QString downloadUrl;
+            QString assetDigest;
             QString expectedPrefix = getExpectedAssetPrefix();
             QString expectedSuffix = getExpectedAssetSuffix();
 
+            QString preferredSuffix = getPreferredAssetSuffix();
+
             if (!expectedSuffix.isEmpty() && releaseObj.contains("assets") && releaseObj["assets"].isArray()) {
                 QJsonArray assets = releaseObj["assets"].toArray();
+
+                // 后备候选：后缀对得上但不带本机架构后缀的那个（旧 release 的命名）
+                QString fallbackUrl;
+                QString fallbackName;
+                QString fallbackDigest;
+
                 for (const auto& asset : std::as_const(assets)) {
                     if (asset.isObject()) {
                         QJsonObject assetObj = asset.toObject();
                         QString assetName = assetObj["name"].toString();
                         bool prefixMatches = expectedPrefix.isEmpty() ||
                                              assetName.startsWith(expectedPrefix, Qt::CaseInsensitive);
+#if defined(Q_OS_WIN32)
+                        // Accept pre-rebrand assets while users transition from Moonlight PC.
+                        if (!prefixMatches) {
+                            const QString legacyPrefix = isPortableInstall()
+                                    ? QStringLiteral("MoonlightPortable-%1-").arg(getCurrentBuildArch())
+                                    : QStringLiteral("MoonlightSetup-");
+                            prefixMatches = assetName.startsWith(legacyPrefix, Qt::CaseInsensitive);
+                        }
+#endif
                         bool suffixMatches = assetName.endsWith(expectedSuffix, Qt::CaseInsensitive);
 
-                        if (prefixMatches && suffixMatches) {
+                        if (!prefixMatches || !suffixMatches) {
+                            continue;
+                        }
+
+                        if (!preferredSuffix.isEmpty() &&
+                                assetName.endsWith(preferredSuffix, Qt::CaseInsensitive)) {
                             downloadUrl = assetObj["browser_download_url"].toString();
-                            qDebug() << "Found matching asset:" << assetName;
+                            assetDigest = assetObj["digest"].toString();
+                            qDebug() << "Found matching asset for this architecture:" << assetName;
                             break;
                         }
+
+                        // 后备只认「没带架构后缀」的旧命名。带了别的架构后缀的资产
+                        // 绝对不能当后备 —— 只发了 arm64 包的 release 会把 arm64 的
+                        // DMG 喂给 Intel 客户端。这种情况下宁可让 downloadUrl 留空，
+                        // 退回打开 release 页面让用户自己看。
+                        bool isOtherArchAsset =
+                                assetName.endsWith(QStringLiteral("-arm64.dmg"), Qt::CaseInsensitive) ||
+                                assetName.endsWith(QStringLiteral("-x86_64.dmg"), Qt::CaseInsensitive) ||
+                                (!preferredSuffix.isEmpty() &&
+                                 (assetName.endsWith(QStringLiteral("-aarch64.AppImage"), Qt::CaseInsensitive) ||
+                                  assetName.endsWith(QStringLiteral("-x86_64.AppImage"), Qt::CaseInsensitive)));
+
+                        if (fallbackUrl.isEmpty() && !isOtherArchAsset) {
+                            fallbackUrl = assetObj["browser_download_url"].toString();
+                            fallbackName = assetName;
+                            fallbackDigest = assetObj["digest"].toString();
+                        }
                     }
+                }
+
+                if (downloadUrl.isEmpty() && !fallbackUrl.isEmpty()) {
+                    downloadUrl = fallbackUrl;
+                    assetDigest = fallbackDigest;
+                    qDebug() << "Found matching asset:" << fallbackName;
                 }
             }
 
@@ -301,17 +436,24 @@ void AutoUpdateChecker::handleUpdateCheckRequestFinished(QNetworkReply* reply)
                 downloadUrl = releaseObj["html_url"].toString();
             }
 
+            m_UpdateDownloadUrl = downloadUrl;
+            m_UpdateAssetDigest = assetDigest;
+
             emit onUpdateAvailable(tagName, downloadUrl);
+            finish(true);
         }
         else if (res > 0) {
             qDebug() << "Current version is newer than latest release";
+            finish(false);
         }
         else {
             qDebug() << "Current version matches latest release";
+            finish(false);
         }
     }
     else {
         qWarning() << "Update checking failed:" << reply->error() << reply->errorString();
         reply->deleteLater();
+        fail();
     }
 }

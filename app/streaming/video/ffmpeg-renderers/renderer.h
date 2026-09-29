@@ -155,6 +155,23 @@ public:
         VTMetal,
     };
 
+    // What the renderer is currently deriving its HDR tone mapping from.
+    //
+    // Purely diagnostic: it drives the performance overlay and the HDR10+ log
+    // message, so a user can tell "the host never sent dynamic metadata" apart
+    // from "it arrived and nothing used it".
+    //
+    // NB: Don't name an enumerator None here. X11's X.h defines None as a macro,
+    // and ffmpeg.cpp reaches it through vaapi.h -> va_x11.h -> Xlib.h before this
+    // header, so the qualified name expands to ToneMappingSource::0L on Linux.
+    enum class ToneMappingSource {
+        Unsupported,  // this renderer never tone maps HDR itself
+        Sdr,          // it does, but the current frame isn't HDR
+        Static,       // HDR10 static mastering metadata only
+        PeakDetect,   // per-frame peak detection
+        Hdr10Plus,    // ST 2094-40 dynamic metadata
+    };
+
     IFFmpegRenderer(RendererType type) : m_Type(type) {}
 
     virtual bool initialize(PDECODER_PARAMETERS params) = 0;
@@ -184,6 +201,11 @@ public:
 
     virtual InitFailureReason getInitFailureReason() {
         return m_InitFailureReason;
+    }
+
+    virtual ToneMappingSource getActiveToneMappingSource() {
+        // Renderers that don't tone map HDR themselves don't have an answer here
+        return ToneMappingSource::Unsupported;
     }
 
     // Called for threaded renderers to allow them to wait prior to us latching
@@ -224,8 +246,8 @@ public:
     }
 
     virtual int getDecoderColorRange() {
-        // Limited is the default
-        return COLOR_RANGE_LIMITED;
+        // Full is the default
+        return COLOR_RANGE_FULL;
     }
 
     virtual int getFrameColorspace(const AVFrame* frame) {
@@ -247,10 +269,16 @@ public:
     }
 
     virtual bool isFrameFullRange(const AVFrame* frame) {
-        // This handles the case where the color range is unknown,
-        // so that we use Limited color range which is the default
-        // behavior for Moonlight.
-        return frame->color_range == AVCOL_RANGE_JPEG;
+        switch (frame->color_range) {
+        case AVCOL_RANGE_JPEG:
+            return true;
+        case AVCOL_RANGE_MPEG:
+            return false;
+        default:
+            // If the color range is not populated, assume the encoder
+            // is sending the color range that we requested.
+            return getDecoderColorRange() == COLOR_RANGE_FULL;
+        }
     }
 
     virtual bool isRenderThreadSupported() {
@@ -502,7 +530,8 @@ public:
         return AV_PIX_FMT_NONE;
     }
 
-    virtual bool initializeEGL(EGLDisplay,
+    virtual bool initializeEGL(IFFmpegRenderer*,
+                               EGLDisplay,
                                const EGLExtensions &) {
         return false;
     }

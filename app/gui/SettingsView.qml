@@ -1,90 +1,91 @@
 import QtQuick 2.9
-import QtQuick.Controls 2.2
-import QtQuick.Layouts 1.2
+import QtQuick.Controls
 import QtQuick.Window 2.2
 
 import StreamingPreferences 1.0
-import ComputerManager 1.0
 import SdlGamepadKeyNavigation 1.0
 import SystemProperties 1.0
 
-Flickable {
+import "settings"
+import "theme"
+
+// 设置页外壳：左侧分类 rail + 右侧卡片内容。
+// 「基本设置」「显示」使用独立页面；其余 6 组保留在 LegacySettingsPage.qml
+// 中以维持翻译上下文，但内部也已经迁移到卡片和设置行。
+// 根用 FocusScope 而不是 Item：工具栏的 Keys.onDownPressed 走的是
+// stackView.currentItem.forceActiveFocus()，落在普通 Item 上会停在一个看不见的
+// 死点上（PcView / AppView 是 GridView + activeFocusOnTab，所以没这问题）。
+// FocusScope 会把焦点转交给内部真正持焦的控件。
+FocusScope {
     id: settingsPage
+    // 这一页自带壁纸，main.qml 不用再垫一层
+    readonly property bool usesOwnBackground: true
     objectName: qsTr("Settings")
-    topMargin: 60
+
     signal languageChanged()
 
-    readonly property bool useCuteChineseTitleFont: StreamingPreferences.language === StreamingPreferences.LANG_ZH_CN ||
-                                                   StreamingPreferences.language === StreamingPreferences.LANG_ZH_TW ||
-                                                   (StreamingPreferences.language === StreamingPreferences.LANG_AUTO &&
-                                                    Qt.locale().name.indexOf("zh") === 0)
-    property font defaultTitleFont: Qt.font({ bold: true, pointSize: 13 })
-    property font cuteChineseTitleFont: Qt.font({ family: "YouYuan", bold: true, pointSize: 13 })
-    property font groupBoxTitleFont: useCuteChineseTitleFont ? cuteChineseTitleFont : defaultTitleFont
+    // 窄窗口时 rail 折叠成顶部横向 tab 条
+    readonly property bool compact: width < Theme.compactBreakpoint
 
-    boundsBehavior: Flickable.OvershootBounds
+    property string category: "basic"
 
-    contentWidth: settingsColumn1.width > settingsColumn2.width ? settingsColumn1.width : settingsColumn2.width
-    contentHeight: settingsColumn1.height > settingsColumn2.height ? settingsColumn1.height : settingsColumn2.height
+    // 图标取自 Microsoft Fluent UI System Icons（MIT），和 FluentWinUI3 是同一套设计语言。
+    // 之前用 emoji，各平台字体不同，渲染出来大小、粗细、配色都对不齐。
+    readonly property var rawCategories: [
+        { key: "basic",    icon: "qrc:/res/fluent/cat-basic.svg",    title: qsTr("Basic Settings") },
+        { key: "display",  icon: "qrc:/res/fluent/cat-display.svg",  title: qsTr("Display Settings") },
+        { key: "audio",    icon: "qrc:/res/fluent/cat-audio.svg",    title: qsTr("Audio Settings") },
+        { key: "host",     icon: "qrc:/res/fluent/cat-host.svg",     title: qsTr("Host Settings") },
+        { key: "input",    icon: "qrc:/res/fluent/cat-input.svg",    title: qsTr("Input Settings") },
+        { key: "gamepad",  icon: "qrc:/res/fluent/cat-gamepad.svg",  title: qsTr("Gamepad Settings") },
+        { key: "peripherals", icon: "qrc:/res/fluent/cat-peripherals.svg", title: qsTr("Peripherals Settings") },
+        { key: "advanced", icon: "qrc:/res/fluent/cat-advanced.svg", title: qsTr("Advanced Settings") },
+        { key: "ui",       icon: "qrc:/res/fluent/cat-ui.svg",       title: qsTr("Software Settings") },
+        { key: "ecosystem",icon: "qrc:/res/fluent/cat-ecosystem.svg",title: qsTr("AlkaidLab Ecosystem") },
+        { key: "about",    icon: "qrc:/res/fluent/cat-about.svg",    title: qsTr("About") }
+    ]
 
-    ScrollBar.vertical: ScrollBar {
-        anchors {
-            left: parent.right
-            leftMargin: -10
-        }
-    }
-
-    function isChildOfFlickable(item) {
-        while (item) {
-            if (item.parent === contentItem) {
-                return true
-            }
-
-            item = item.parent
-        }
-        return false
-    }
-
-    NumberAnimation on contentY {
-        id: autoScrollAnimation
-        duration: 100
-    }
-
-    Window.onActiveFocusItemChanged: {
-        var item = Window.activeFocusItem
-        if (item) {
-            // Ignore non-child elements like the toolbar buttons
-            if (!isChildOfFlickable(item)) {
-                return
-            }
-
-            // Map the focus item's position into our content item's coordinate space
-            var pos = item.mapToItem(contentItem, 0, 0)
-
-            // Ensure some extra space is visible around the element we're scrolling to
-            var scrollMargin = height > 100 ? 50 : 0
-
-            if (pos.y - scrollMargin < contentY) {
-                autoScrollAnimation.from = contentY
-                autoScrollAnimation.to = Math.max(pos.y - scrollMargin, 0)
-                autoScrollAnimation.start()
-            }
-            else if (pos.y + item.height + scrollMargin > contentY + height) {
-                autoScrollAnimation.from = contentY
-                autoScrollAnimation.to = Math.min(pos.y + item.height + scrollMargin - height, contentHeight - height)
-                autoScrollAnimation.start()
-            }
-        }
-    }
+    // USB 设备转发只在有本地 USB/IP 后端的平台提供（Windows/macOS）；
+    // 没有的平台连分类一起隐藏，避免出现空页。
+    readonly property var categories: rawCategories.filter(
+        function(c) {
+            return c.key !== "peripherals" || SystemProperties.usbForwardingAvailable
+        })
 
     StackView.onActivated: {
         // This enables Tab and BackTab based navigation rather than arrow keys.
         // It is required to shift focus between controls on the settings page.
         SdlGamepadKeyNavigation.setUiNavMode(true)
 
-        // Highlight the first item if a gamepad is connected
+        // 手柄进来时把焦点放在分类栏的当前分类上，而不是内容区第一个控件。
+        //
+        // 以前是直接点基本设置页的分辨率下拉，于是用户进设置的第一下左右输入就把
+        // 分辨率改了（issue #144）。落在分类栏上就没这个问题：分类栏不吃左右键，
+        // 而且 category 是跨次保留的，从分类栏出发永远是可见、可用的那一项。
         if (SdlGamepadKeyNavigation.getConnectedGamepads() > 0) {
-            resolutionComboBox.forceActiveFocus(Qt.TabFocus)
+            rail.focusCurrent()
+        }
+    }
+
+    // 焦点在内容区时，B / Esc 先退回分类栏；已经在分类栏了才放行给 main.qml
+    // 去弹出整个设置页。之前不分级，手柄用户在内容区随手一个 B 就整页退出了。
+    Keys.onEscapePressed: function(event) {
+        event.accepted = !rail.railFocused
+        if (event.accepted) {
+            rail.focusCurrent()
+        }
+    }
+
+    // 把焦点交给内容区的第一个可聚焦控件。
+    //
+    // 不直接引用某个页面的首个控件：那只对基本设置页有效，其余六组还在
+    // LegacySettingsPage 里，而且随分类切换。scrollArea 在声明顺序上排在分类栏
+    // 之后，往后走一格 Tab 就是它内部第一个可聚焦控件 —— 焦点链本身会跳过
+    // 不可见的分类。
+    function focusContent() {
+        var first = scrollArea.nextItemInFocusChain(true)
+        if (first) {
+            first.forceActiveFocus(Qt.TabFocusReason)
         }
     }
 
@@ -101,2253 +102,170 @@ Flickable {
         StreamingPreferences.save()
     }
 
-    PcView {
-        id: pcViewPage
-    }
-
-    Rectangle {
-        parent: settingsPage
-        anchors.fill: parent
-        z: -2
-
-        Image {
-            anchors.fill: parent
-            source: pcViewPage.currentBgUrl || "qrc:/res/gura.png"
-            opacity: 0.35
-            fillMode: Image.PreserveAspectCrop
+    // 焦点落到 FocusScope 壳自己身上时（工具栏按向下、或 StackView 切页回来），
+    // 转交给分类栏。停在壳上是个看不见的死点，用户得多按一次才有反应。
+    onActiveFocusChanged: {
+        if (activeFocus && Window.window && Window.window.activeFocusItem === settingsPage) {
+            rail.focusCurrent()
         }
     }
 
-    Rectangle {
-        parent: settingsPage
+    // 手柄 LB/RB 映射成 PageUp/PageDown，用来切分类
+    Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_PageUp) {
+            rail.step(-1)
+            // 切完分类要把焦点收回分类栏：原来持焦的控件已经随着旧分类隐藏了，
+            // 焦点会凭空消失，手柄看起来就像失灵。
+            rail.focusCurrent()
+            event.accepted = true
+        }
+        else if (event.key === Qt.Key_PageDown) {
+            rail.step(1)
+            rail.focusCurrent()
+            event.accepted = true
+        }
+    }
+
+    // Reuse the background already owned by the application window. Creating a
+    // hidden PcView here duplicated its model, network work, and scene graph.
+    Image {
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, 0.55)
+        visible: StreamingPreferences.backgroundSource !== StreamingPreferences.BGS_NONE
+        source: Window.window && Window.window.backgroundImageUrl !== ""
+                ? Window.window.backgroundImageUrl
+                : "qrc:/res/gura.png"
+        fillMode: Image.PreserveAspectCrop
+        z: -2
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        visible: StreamingPreferences.backgroundSource !== StreamingPreferences.BGS_NONE
+        color: Qt.rgba(Theme.ink.r, Theme.ink.g, Theme.ink.b,
+                       StreamingPreferences.backgroundOverlayOpacity / 100.0)
         z: -1
     }
 
-    Column {
-        padding: 10
-        id: settingsColumn1
-        width: settingsPage.width / 2
-        spacing: 15
-        z: 1
+    Item {
+        id: body
 
-        GroupBox {
-            id: basicSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">⚙ " + qsTr("Basic Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
+        anchors {
+            fill: parent
+            // 让出顶部工具栏（56）+ 一格间距
+            topMargin: 72
+            leftMargin: Theme.spaceLg
+            rightMargin: Theme.spaceLg
+            bottomMargin: Theme.spaceSm
+        }
 
-            Column {
-                anchors.fill: parent
-                spacing: 5
+        Rectangle {
+            id: railBackground
 
-                Label {
-                    width: parent.width
-                    id: resFPStitle
-                    text: qsTr("Resolution and FPS")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
+            anchors {
+                left: parent.left
+                top: parent.top
+            }
+            width: settingsPage.compact ? body.width : Theme.railWidth
+            height: settingsPage.compact ? 52 : body.height
+
+            // 分类栏底板。方角 + 1px 描边，不用硬投影：它贴着窗口左边，
+            // 投影只会在右侧和内容区挤在一起。
+            radius: 0
+            color: Theme.surfaceLayer
+            border.width: 1
+            border.color: Theme.line
+
+            CategoryRail {
+                id: rail
+                anchors {
+                    fill: parent
+                    margins: Theme.spaceXs
                 }
-
-                Label {
-                    width: parent.width
-                    id: resFPSdesc
-                    text: qsTr("Setting values too high for your PC or network connection may cause lag, stuttering, or errors.")
-                    font.pointSize: 9
-                    wrapMode: Text.Wrap
+                compact: settingsPage.compact
+                categories: settingsPage.categories
+                currentCategory: settingsPage.category
+                onCategoryPicked: function(category) {
+                    settingsPage.category = category
+                    scrollArea.contentY = 0
                 }
-
-                Row {
-                    spacing: 5
-                    width: parent.width
-
-                    AutoResizingComboBox {
-                        property int lastIndexValue
-
-                        function addDetectedResolution(friendlyNamePrefix, rect) {
-                            var indexToAdd = 0
-                            for (var j = 0; j < resolutionComboBox.count; j++) {
-                                var existing_width = parseInt(resolutionListModel.get(j).video_width);
-                                var existing_height = parseInt(resolutionListModel.get(j).video_height);
-
-                                if (rect.width === existing_width && rect.height === existing_height) {
-                                    // Duplicate entry, skip
-                                    indexToAdd = -1
-                                    break
-                                }
-                                else if (rect.width * rect.height > existing_width * existing_height) {
-                                    // Candidate entrypoint after this entry
-                                    indexToAdd = j + 1
-                                }
-                            }
-
-                            // Insert this display's resolution if it's not a duplicate
-                            if (indexToAdd >= 0) {
-                                resolutionListModel.insert(indexToAdd,
-                                                           {
-                                                               "text": friendlyNamePrefix+" ("+rect.width+"x"+rect.height+")",
-                                                               "video_width": ""+rect.width,
-                                                               "video_height": ""+rect.height,
-                                                               "is_custom": false
-                                                           })
-                            }
-                        }
-
-                        // ignore setting the index at first, and actually set it when the component is loaded
-                        Component.onCompleted: {
-                            // Refresh display data before using it to build the list
-                            SystemProperties.refreshDisplays()
-
-                            // Add native and safe area resolutions for all attached displays
-                            var done = false
-                            for (var displayIndex = 0; !done; displayIndex++) {
-                                var screenRect = SystemProperties.getNativeResolution(displayIndex);
-                                var safeAreaRect = SystemProperties.getSafeAreaResolution(displayIndex);
-
-                                if (screenRect.width === 0) {
-                                    // Exceeded max count of displays
-                                    done = true
-                                    break
-                                }
-
-                                addDetectedResolution(qsTr("Native"), screenRect)
-                                addDetectedResolution(qsTr("Native (Excluding Notch)"), safeAreaRect)
-                            }
-
-                            // Prune resolutions that are over the decoder's maximum
-                            var max_pixels = SystemProperties.maximumResolution.width * SystemProperties.maximumResolution.height;
-                            if (max_pixels > 0) {
-                                for (var j = 0; j < resolutionComboBox.count; j++) {
-                                    var existing_width = parseInt(resolutionListModel.get(j).video_width);
-                                    var existing_height = parseInt(resolutionListModel.get(j).video_height);
-
-                                    if (existing_width * existing_height > max_pixels) {
-                                        resolutionListModel.remove(j)
-                                        j--
-                                    }
-                                }
-                            }
-
-                            // load the saved width/height, and iterate through the ComboBox until a match is found
-                            // and set it to that index.
-                            var saved_width = StreamingPreferences.width
-                            var saved_height = StreamingPreferences.height
-                            var index_set = false
-                            for (var i = 0; i < resolutionListModel.count; i++) {
-                                var el_width = parseInt(resolutionListModel.get(i).video_width);
-                                var el_height = parseInt(resolutionListModel.get(i).video_height);
-
-                                if (saved_width === el_width && saved_height === el_height) {
-                                    currentIndex = i
-                                    index_set = true
-                                    break
-                                }
-                            }
-
-                            if (!index_set) {
-                                // We did not find a match. This must be a custom resolution.
-                                resolutionListModel.append({
-                                                               "text": qsTr("Custom")+" ("+StreamingPreferences.width+"x"+StreamingPreferences.height+")",
-                                                               "video_width": ""+StreamingPreferences.width,
-                                                               "video_height": ""+StreamingPreferences.height,
-                                                               "is_custom": true
-                                                           })
-                                currentIndex = resolutionListModel.count - 1
-                            }
-                            else {
-                                resolutionListModel.append({
-                                                               "text": qsTr("Custom"),
-                                                               "video_width": "",
-                                                               "video_height": "",
-                                                               "is_custom": true
-                                                           })
-                            }
-
-                            // Since we don't call activate() here, we need to trigger
-                            // width calculation manually
-                            recalculateWidth()
-
-                            lastIndexValue = currentIndex
-                        }
-
-                        id: resolutionComboBox
-                        maximumWidth: parent.width / 2
-                        textRole: "text"
-                        model: ListModel {
-                            id: resolutionListModel
-                            // Other elements may be added at runtime
-                            // based on attached display resolution
-                            ListElement {
-                                text: qsTr("720p")
-                                video_width: "1280"
-                                video_height: "720"
-                                is_custom: false
-                            }
-                            ListElement {
-                                text: qsTr("1080p")
-                                video_width: "1920"
-                                video_height: "1080"
-                                is_custom: false
-                            }
-                            ListElement {
-                                text: qsTr("1440p")
-                                video_width: "2560"
-                                video_height: "1440"
-                                is_custom: false
-                            }
-                            ListElement {
-                                text: qsTr("4K")
-                                video_width: "3840"
-                                video_height: "2160"
-                                is_custom: false
-                            }
-                        }
-
-                        function updateBitrateForSelection() {
-                            var selectedWidth = parseInt(resolutionListModel.get(currentIndex).video_width)
-                            var selectedHeight = parseInt(resolutionListModel.get(currentIndex).video_height)
-
-                            // Only modify the bitrate if the values actually changed
-                            if (StreamingPreferences.width !== selectedWidth || StreamingPreferences.height !== selectedHeight) {
-                                StreamingPreferences.width = selectedWidth
-                                StreamingPreferences.height = selectedHeight
-
-                                if (StreamingPreferences.autoAdjustBitrate) {
-                                    StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                                                              StreamingPreferences.height,
-                                                                                                              StreamingPreferences.fps,
-                                                                                                              StreamingPreferences.enableYUV444);
-                                    slider.value = Math.log(StreamingPreferences.bitrateKbps)
-                                }
-                            }
-
-                            lastIndexValue = currentIndex
-                        }
-
-                        // ::onActivated must be used, as it only listens for when the index is changed by a human
-                        onActivated : {
-                            if (resolutionListModel.get(currentIndex).is_custom) {
-                                customResolutionDialog.open()
-                            }
-                            else {
-                                updateBitrateForSelection()
-                            }
-                        }
-
-                        NavigableDialog {
-                            id: customResolutionDialog
-                            standardButtons: Dialog.Ok | Dialog.Cancel
-                            onOpened: {
-                                // Force keyboard focus on the textbox so keyboard navigation works
-                                widthField.forceActiveFocus()
-
-                                // standardButton() was added in Qt 5.10, so we must check for it first
-                                if (customResolutionDialog.standardButton) {
-                                    customResolutionDialog.standardButton(Dialog.Ok).enabled = customResolutionDialog.isInputValid()
-                                }
-                            }
-
-                            onClosed: {
-                                widthField.clear()
-                                heightField.clear()
-                            }
-
-                            onRejected: {
-                                resolutionComboBox.currentIndex = resolutionComboBox.lastIndexValue
-                            }
-
-                            function isInputValid() {
-                                // If we have text in either textbox that isn't valid,
-                                // reject the input.
-                                if ((!widthField.acceptableInput && widthField.text) ||
-                                        (!heightField.acceptableInput && heightField.text)) {
-                                    return false
-                                }
-
-                                // The textboxes need to have text or placeholder text
-                                if ((!widthField.text && !widthField.placeholderText) ||
-                                        (!heightField.text && !heightField.placeholderText)) {
-                                    return false
-                                }
-
-                                return true
-                            }
-
-                            onAccepted: {
-                                // Reject if there's invalid input
-                                if (!isInputValid()) {
-                                    reject()
-                                    return
-                                }
-
-                                var width = widthField.text ? widthField.text : widthField.placeholderText
-                                var height = heightField.text ? heightField.text : heightField.placeholderText
-
-                                // Find and update the custom entry
-                                for (var i = 0; i < resolutionListModel.count; i++) {
-                                    if (resolutionListModel.get(i).is_custom) {
-                                        resolutionListModel.setProperty(i, "video_width", width)
-                                        resolutionListModel.setProperty(i, "video_height", height)
-                                        resolutionListModel.setProperty(i, "text", "Custom ("+width+"x"+height+")")
-
-                                        // Now update the bitrate using the custom resolution
-                                        resolutionComboBox.currentIndex = i
-                                        resolutionComboBox.updateBitrateForSelection()
-
-                                        // Update the combobox width too
-                                        resolutionComboBox.recalculateWidth()
-                                        break
-                                    }
-                                }
-                            }
-
-                            ColumnLayout {
-                                Label {
-                                    text: qsTr("Custom resolutions are not officially supported by GeForce Experience, so it will not set your host display resolution. You will need to set it manually while in game.") + "\n\n" +
-                                          qsTr("Resolutions that are not supported by your client or host PC may cause streaming errors.") + "\n"
-                                    wrapMode: Label.WordWrap
-                                    Layout.maximumWidth: 300
-                                }
-
-                                Label {
-                                    text: qsTr("Enter a custom resolution:")
-                                    font.bold: true
-                                }
-
-                                RowLayout {
-                                    TextField {
-                                        id: widthField
-                                        maximumLength: 5
-                                        inputMethodHints: Qt.ImhDigitsOnly
-                                        placeholderText: resolutionListModel.get(resolutionComboBox.currentIndex).video_width
-                                        validator: IntValidator{bottom:256; top:8192}
-                                        focus: true
-
-                                        onTextChanged: {
-                                            // standardButton() was added in Qt 5.10, so we must check for it first
-                                            if (customResolutionDialog.standardButton) {
-                                                customResolutionDialog.standardButton(Dialog.Ok).enabled = customResolutionDialog.isInputValid()
-                                            }
-                                        }
-
-                                        Keys.onReturnPressed: {
-                                            customResolutionDialog.accept()
-                                        }
-
-                                        Keys.onEnterPressed: {
-                                            customResolutionDialog.accept()
-                                        }
-                                    }
-
-                                    Label {
-                                        text: "x"
-                                        font.bold: true
-                                    }
-
-                                    TextField {
-                                        id: heightField
-                                        maximumLength: 5
-                                        inputMethodHints: Qt.ImhDigitsOnly
-                                        placeholderText: resolutionListModel.get(resolutionComboBox.currentIndex).video_height
-                                        validator: IntValidator{bottom:256; top:8192}
-
-                                        onTextChanged: {
-                                            // standardButton() was added in Qt 5.10, so we must check for it first
-                                            if (customResolutionDialog.standardButton) {
-                                                customResolutionDialog.standardButton(Dialog.Ok).enabled = customResolutionDialog.isInputValid()
-                                            }
-                                        }
-
-                                        Keys.onReturnPressed: {
-                                            customResolutionDialog.accept()
-                                        }
-
-                                        Keys.onEnterPressed: {
-                                            customResolutionDialog.accept()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    AutoResizingComboBox {
-                        property int lastIndexValue
-
-                        function updateBitrateForSelection() {
-                            // Only modify the bitrate if the values actually changed
-                            var selectedFps = parseInt(model.get(fpsComboBox.currentIndex).video_fps)
-                            if (StreamingPreferences.fps !== selectedFps) {
-                                StreamingPreferences.fps = selectedFps
-
-                                if (StreamingPreferences.autoAdjustBitrate) {
-                                    StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                                                              StreamingPreferences.height,
-                                                                                                              StreamingPreferences.fps,
-                                                                                                              StreamingPreferences.enableYUV444);
-                                    slider.value = Math.log(StreamingPreferences.bitrateKbps)
-                                }
-                            }
-
-                            lastIndexValue = currentIndex
-                        }
-
-                        NavigableDialog {
-                            function isInputValid() {
-                                // If we have text that isn't valid, reject the input.
-                                if (!fpsField.acceptableInput && fpsField.text) {
-                                    return false
-                                }
-
-                                // The textbox needs to have text or placeholder text
-                                if (!fpsField.text && !fpsField.placeholderText) {
-                                    return false
-                                }
-
-                                return true
-                            }
-
-                            id: customFpsDialog
-                            standardButtons: Dialog.Ok | Dialog.Cancel
-                            onOpened: {
-                                // Force keyboard focus on the textbox so keyboard navigation works
-                                fpsField.forceActiveFocus()
-
-                                // standardButton() was added in Qt 5.10, so we must check for it first
-                                if (customFpsDialog.standardButton) {
-                                    customFpsDialog.standardButton(Dialog.Ok).enabled = customFpsDialog.isInputValid()
-                                }
-                            }
-
-                            onClosed: {
-                                fpsField.clear()
-                            }
-
-                            onRejected: {
-                                fpsComboBox.currentIndex = fpsComboBox.lastIndexValue
-                            }
-
-                            onAccepted: {
-                                // Reject if there's invalid input
-                                if (!isInputValid()) {
-                                    reject()
-                                    return
-                                }
-
-                                var fps = fpsField.text ? fpsField.text : fpsField.placeholderText
-
-                                // Find and update the custom entry
-                                for (var i = 0; i < fpsListModel.count; i++) {
-                                    if (fpsListModel.get(i).is_custom) {
-                                        fpsListModel.setProperty(i, "video_fps", fps)
-                                        fpsListModel.setProperty(i, "text", qsTr("Custom (%1 FPS)").arg(fps))
-
-                                        // Now update the bitrate using the custom resolution
-                                        fpsComboBox.currentIndex = i
-                                        fpsComboBox.updateBitrateForSelection()
-
-                                        // Update the combobox width too
-                                        fpsComboBox.recalculateWidth()
-                                        break
-                                    }
-                                }
-                            }
-
-                            ColumnLayout {
-                                Label {
-                                    text: qsTr("Enter a custom frame rate:")
-                                    font.bold: true
-                                }
-
-                                RowLayout {
-                                    TextField {
-                                        id: fpsField
-                                        maximumLength: 4
-                                        inputMethodHints: Qt.ImhDigitsOnly
-                                        placeholderText: fpsListModel.get(fpsComboBox.currentIndex).video_fps
-                                        validator: IntValidator{bottom:10; top:9999}
-                                        focus: true
-
-                                        onTextChanged: {
-                                            // standardButton() was added in Qt 5.10, so we must check for it first
-                                            if (customFpsDialog.standardButton) {
-                                                customFpsDialog.standardButton(Dialog.Ok).enabled = customFpsDialog.isInputValid()
-                                            }
-                                        }
-
-                                        Keys.onReturnPressed: {
-                                            customFpsDialog.accept()
-                                        }
-
-                                        Keys.onEnterPressed: {
-                                            customFpsDialog.accept()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        function addRefreshRateOrdered(fpsListModel, refreshRate, description, custom) {
-                            var indexToAdd = 0
-                            for (var j = 0; j < fpsListModel.count; j++) {
-                                var existing_fps = parseInt(fpsListModel.get(j).video_fps);
-
-                                if (refreshRate === existing_fps || (custom && fpsListModel.get(j).is_custom)) {
-                                    // Duplicate entry, skip
-                                    indexToAdd = -1
-                                    break
-                                }
-                                else if (refreshRate > existing_fps) {
-                                    // Candidate entrypoint after this entry
-                                    indexToAdd = j + 1
-                                }
-                            }
-
-                            // Insert this frame rate if it's not a duplicate
-                            if (indexToAdd >= 0) {
-                                // Custom values always go at the end of the list
-                                if (custom) {
-                                    indexToAdd = fpsListModel.count
-                                }
-
-                                fpsListModel.insert(indexToAdd,
-                                                    {
-                                                        "text": description,
-                                                        "video_fps": ""+refreshRate,
-                                                        "is_custom": custom
-                                                    })
-                            }
-
-                            return indexToAdd
-                        }
-
-                        function reinitialize() {
-                            // Add native refresh rate for all attached displays
-                            var done = false
-                            for (var displayIndex = 0; !done; displayIndex++) {
-                                var refreshRate = SystemProperties.getRefreshRate(displayIndex);
-                                if (refreshRate === 0) {
-                                    // Exceeded max count of displays
-                                    done = true
-                                    break
-                                }
-
-                                addRefreshRateOrdered(fpsListModel, refreshRate, qsTr("%1 FPS").arg(refreshRate), false)
-                            }
-
-                            var saved_fps = StreamingPreferences.fps
-                            var found = false
-                            for (var i = 0; i < model.count; i++) {
-                                var el_fps = parseInt(model.get(i).video_fps);
-
-                                // Look for a matching frame rate
-                                if (saved_fps === el_fps) {
-                                    currentIndex = i
-                                    found = true
-                                    break
-                                }
-                            }
-
-                            // If we didn't find one, add a custom frame rate for the current value
-                            if (!found) {
-                                currentIndex = addRefreshRateOrdered(model, saved_fps, qsTr("Custom (%1 FPS)").arg(saved_fps), true)
-                            }
-                            else {
-                                addRefreshRateOrdered(model, "", qsTr("Custom"), true)
-                            }
-
-                            recalculateWidth()
-
-                            lastIndexValue = currentIndex
-                        }
-
-                        // ignore setting the index at first, and actually set it when the component is loaded
-                        Component.onCompleted: {
-                            reinitialize()
-                            languageChanged.connect(reinitialize)
-                        }
-
-                        model: ListModel {
-                            id: fpsListModel
-                            // Other elements may be added at runtime
-                            ListElement {
-                                text: qsTr("30 FPS")
-                                video_fps: "30"
-                                is_custom: false
-                            }
-                            ListElement {
-                                text: qsTr("60 FPS")
-                                video_fps: "60"
-                                is_custom: false
-                            }
-                        }
-
-                        id: fpsComboBox
-                        maximumWidth: parent.width / 2
-                        textRole: "text"
-                        // ::onActivated must be used, as it only listens for when the index is changed by a human
-                        onActivated : {
-                            if (model.get(currentIndex).is_custom) {
-                                customFpsDialog.open()
-                            }
-                            else {
-                                updateBitrateForSelection()
-                            }
-                        }
-                    }
-                }
-
-                Label {
-                    width: parent.width
-                    id: bitrateTitle
-                    text: qsTr("Video bitrate:")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                Label {
-                    width: parent.width
-                    id: bitrateDesc
-                    text: qsTr("Lower the bitrate on slower connections. Raise the bitrate to increase image quality.")
-                    font.pointSize: 9
-                    wrapMode: Text.Wrap
-                }
-
-                Row {
-                    spacing: 5
-                    width: parent.width
-
-                    Slider {
-                        id: slider
-
-                        // 使用对数刻度来实现非线性调整
-                        property real logMin: Math.log(500)
-                        property real logMax: Math.log(2000000)
-                        property real linearThreshold: 100000 // 100 Mbps 的线性调整阈值
-
-                        value: Math.log(StreamingPreferences.bitrateKbps)
-                        stepSize: (logMax - logMin) / 200
-                        from: logMin
-                        to: logMax
-
-                        snapMode: "SnapOnRelease"
-                        width: Math.min(bitrateDesc.implicitWidth, parent.width)
-
-                        handle: Rectangle {
-                            x: slider.visualPosition * (slider.width - width)
-                            y: (slider.height - height) / 2
-                            width: 24
-                            height: 24
-                            radius: 12
-                            color: "#FFA5D2"
-                            border.color: "#ffffff"
-                            border.width: 2
-                        }
-
-                        background: Rectangle {
-                            x: 0
-                            y: (slider.height - height) / 2
-                            width: slider.width
-                            height: 6
-                            radius: 3
-                            color: "#e0e0e0"
-
-                            Rectangle {
-                                width: slider.visualPosition * parent.width
-                                height: parent.height
-                                color: "#FFA5D2"
-                                radius: 3
-                            }
-                        }
-
-                        onValueChanged: {
-                            var linearValue;
-                            if (Math.exp(value) <= linearThreshold) {
-                                // 在 100 Mbps 以下使用线性调整
-                                linearValue = Math.exp(value);
-                            } else {
-                                // 在 100 Mbps 以上使用对数调整
-                                linearValue = Math.exp(value);
-                            }
-
-                            // 根据条件格式化显示文本
-                            var displayValue = linearValue / 1000.0;
-                            if (displayValue < 100) {
-                                bitrateTitle.text = qsTr("Video bitrate: %1 Mbps").arg(displayValue.toFixed(1))
-                            } else {
-                                bitrateTitle.text = qsTr("Video bitrate: %1 Mbps").arg(Math.round(displayValue))
-                            }
-
-                            StreamingPreferences.bitrateKbps = linearValue
-                        }
-
-                        onMoved: {
-                            StreamingPreferences.autoAdjustBitrate = false
-                        }
-
-                        Component.onCompleted: {
-                            // Refresh the text after translations change
-                            languageChanged.connect(valueChanged)
-                        }
-                    }
-                }
-                
-                Button {
-                    id: resetBitrateButton
-                    text: qsTr("Use Default (%1 Mbps)").arg(StreamingPreferences.getDefaultBitrate(StreamingPreferences.width, StreamingPreferences.height, StreamingPreferences.fps, StreamingPreferences.enableYUV444) / 1000.0)
-                    visible: StreamingPreferences.bitrateKbps !== StreamingPreferences.getDefaultBitrate(StreamingPreferences.width, StreamingPreferences.height, StreamingPreferences.fps, StreamingPreferences.enableYUV444)
-                    onClicked: {
-                        var defaultBitrate = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width, StreamingPreferences.height, StreamingPreferences.fps, StreamingPreferences.enableYUV444)
-                        StreamingPreferences.bitrateKbps = defaultBitrate
-                        StreamingPreferences.autoAdjustBitrate = true
-                        slider.value = Math.log(defaultBitrate)
-                    }
-                    
-                    hoverEnabled: true
-                }
-
-                CheckBox {
-                    id: sunshineAbrCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Smart bitrate with Sunshine")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.enableSunshineAbr
-                    onCheckedChanged: {
-                        StreamingPreferences.enableSunshineAbr = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 8000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Allows Sunshine to automatically adjust stream bitrate up to the selected video bitrate when the host supports ABR.")
-                }
-
-                Label {
-                    width: parent.width
-                    id: windowModeTitle
-                    text: qsTr("Display mode")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                    visible: SystemProperties.hasDesktopEnvironment
-                }
-
-                AutoResizingComboBox {
-                    function createModel() {
-                        var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
-
-                        model.append({
-                                         text: qsTr("Fullscreen"),
-                                         val: StreamingPreferences.WM_FULLSCREEN
-                                     })
-
-                        model.append({
-                                         text: qsTr("Borderless windowed"),
-                                         val: StreamingPreferences.WM_FULLSCREEN_DESKTOP
-                                     })
-
-                        model.append({
-                                         text: qsTr("Windowed"),
-                                         val: StreamingPreferences.WM_WINDOWED
-                                     })
-
-
-                        // Set the recommended option based on the OS
-                        for (var i = 0; i < model.count; i++) {
-                            var thisWm = model.get(i).val;
-                            if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
-                                model.get(i).text += " " + qsTr("(Recommended)")
-                                model.move(i, 0, 1)
-                                break
-                            }
-                        }
-
-                        return model
-                    }
-
-
-                    // This is used on initialization and upon retranslation
-                    function reinitialize() {
-                        if (!visible) {
-                            // Do nothing if the control won't even be visible
-                            return
-                        }
-
-                        model = createModel()
-                        currentIndex = 0
-
-                        // Set the current value based on the saved preferences
-                        var savedWm = StreamingPreferences.windowMode
-                        for (var i = 0; i < model.count; i++) {
-                             var thisWm = model.get(i).val;
-                             if (savedWm === thisWm) {
-                                 currentIndex = i
-                                 break
-                             }
-                        }
-
-                        activated(currentIndex)
-                    }
-
-                    Component.onCompleted: {
-                        reinitialize()
-                        languageChanged.connect(reinitialize)
-                    }
-
-                    id: windowModeComboBox
-                    visible: SystemProperties.hasDesktopEnvironment
-                    enabled: !SystemProperties.rendererAlwaysFullScreen
-                    hoverEnabled: true
-                    textRole: "text"
-                    onActivated: {
-                        StreamingPreferences.windowMode = model.get(currentIndex).val
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
-                }
-
-                CheckBox {
-                    id: ignoreAspectRatioCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Stretch presentation")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.ignoreAspectRatio
-                    onCheckedChanged: {
-                        StreamingPreferences.ignoreAspectRatio = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 12000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Ignores both client and host PC aspect ratios, which is required for displaying Half-SBS (Side-By-Side) 3D signals to AR/XR devices that only support Full-SBS (usually 1920x1080 per eye, meaning a total resolution of 3840x1080)")
-                }
-
-                CheckBox {
-                    id: vsyncCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("V-Sync")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.enableVsync
-                    onCheckedChanged: {
-                        StreamingPreferences.enableVsync = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Disabling V-Sync allows sub-frame rendering latency, but it can display visible tearing")
-                }
-
-                CheckBox {
-                    id: framePacingCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Frame pacing")
-                    font.pointSize:  12
-                    enabled: StreamingPreferences.enableVsync
-                    checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
-                    onCheckedChanged: {
-                        StreamingPreferences.framePacing = checked
-                    }
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
-                }
-
-                CheckBox {
-                    id: videoEnhancementCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Video AI-Enhancement")
-                    font.pointSize:  12
-                    enabled: SystemProperties.isVideoEnhancementCapable()
-                    checked: {
-                        return SystemProperties.isVideoEnhancementCapable() && StreamingPreferences.videoEnhancement
-                    }
-                    property bool keepValue: checked;
-                    onCheckedChanged: {
-                        StreamingPreferences.videoEnhancement = checked
-                    }
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text:
-                        qsTr("Enhance video quality by utilizing the GPU's AI-Enhancement capabilities.") + "\n" +
-                        qsTr("This feature effectively upscales, reduces compression artifacts and enhances the clarity of streamed content.")+ "\n" + 
-                        qsTr("Note:")+ "\n" + 
-                        qsTr("If available, ensure that appropriate settings (i.e. RTX Video enhancement) are enabled in your GPU driver configuration.")+ "\n" + 
-                        qsTr("HDR rendering has divers issues depending on the GPU used, we are working on it but we advise to currently use Non-HDR.")+ "\n" + 
-                        qsTr("Be advised that using this feature on laptops running on battery power may lead to significant battery drain.")
-
-                    Component.onCompleted: {
-                        if (!SystemProperties.isVideoEnhancementCapable()){
-                            // VSR or SDR->HDR feature could not be initialized by any GPU available
-                            text = qsTr("Video AI-Enhancement (Not supported by the GPU)")
-                            enabled = false;
-                            checked = false;
-                        } else if(SystemProperties.isVideoEnhancementExperimental()){
-                            // Indicate if the feature is available but not officially deployed by the Vendor
-                            text = qsTr("Video AI-Enhancement (Experimental)")
-                        }
-                    }
-                }
-
-                // Stream Resolution Scale
-                RowLayout {
-                    CheckBox {
-                        id: streamResolutionScaleCheck
-                        text: qsTr("Stream Resolution Scale")
-                        font.pointSize: 12
-                        checked: StreamingPreferences.streamResolutionScale
-                        onCheckedChanged: {
-                            StreamingPreferences.streamResolutionScale = checked
-                        }
-                    }
-
-                    TextField {
-                        id: streamResolutionScaleRatioField
-                        maximumLength: 3
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        validator: IntValidator{bottom:20; top:100}
-                        Layout.preferredWidth: 60
-                        visible: streamResolutionScaleCheck.checked
-                        text: StreamingPreferences.streamResolutionScaleRatio.toString()
-                        onTextChanged: {
-                            let value = parseInt(text);
-                            if (!isNaN(value) && value >= 20 && value <= 100) {
-                                StreamingPreferences.streamResolutionScaleRatio = value;
-                            }
-                        }
-                    }
-
-                    Label {
-                        text: "%"
-                        font.bold: true
-                        visible: streamResolutionScaleCheck.checked
-                    }
-                }
-
-                // Remote Resolution
-                RowLayout {
-                    CheckBox {
-                        id: remoteResolutionCheck
-                        Layout.fillWidth: true
-                        text: qsTr("Remote Resolution")
-                        font.pointSize: 12
-                        checked: StreamingPreferences.remoteResolution
-                        onCheckedChanged: {
-                            StreamingPreferences.remoteResolution = checked
-                        }
-                    }
-
-                    TextField {
-                        id: remoteResolutionWidthField
-                        maximumLength: 4
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        placeholderText: "1280"
-                        validator: IntValidator{bottom:256; top:8192}
-                        Layout.preferredWidth: 120
-                        visible: remoteResolutionCheck.checked
-                        text: StreamingPreferences.remoteResolutionWidth > 0 ? StreamingPreferences.remoteResolutionWidth.toString() : "800"
-                        onTextChanged: {
-                            let value = parseInt(text);
-                            if (!isNaN(value)) {
-                                StreamingPreferences.remoteResolutionWidth = value;
-                            }
-                        }
-                    }
-                    
-                    Label {
-                        text: "x"
-                        font.bold: true
-                        visible: remoteResolutionCheck.checked
-                        Layout.alignment: Qt.AlignVCenter
-                    }
-                    
-                    TextField {
-                        id: remoteResolutionHeightField
-                        maximumLength: 4
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        placeholderText: "720"
-                        validator: IntValidator{bottom:256; top:8192}
-                        Layout.preferredWidth: 120
-                        visible: remoteResolutionCheck.checked
-                        text: StreamingPreferences.remoteResolutionHeight > 0 ? StreamingPreferences.remoteResolutionHeight.toString() : "600"
-                        onTextChanged: {
-                            let value = parseInt(text);
-                            if (!isNaN(value)) {
-                                StreamingPreferences.remoteResolutionHeight = value;
-                            }
-                        }
-                    }
-                }
-
-                // Remote Frame Rate
-                RowLayout {
-                    CheckBox {
-                        id: remoteFpsCheck
-                        text: qsTr("Remote Frame Rate")
-                        font.pointSize: 12
-                        checked: StreamingPreferences.remoteFps
-                        onCheckedChanged: {
-                            StreamingPreferences.remoteFps = checked
-                        }
-                    }
-                    
-                    TextField {
-                        id: remoteFpsRateField
-                        maximumLength: 3
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        validator: IntValidator{bottom:1; top:512}
-                        Layout.preferredWidth: 80
-                        visible: remoteFpsCheck.checked
-                        text: StreamingPreferences.remoteFpsRate > 0 ? StreamingPreferences.remoteFpsRate.toString() : "60"
-                        onTextChanged: {
-                            let value = parseInt(text);
-                            if (!isNaN(value)) {
-                                StreamingPreferences.remoteFpsRate = value;
-                            }
-                        }
-                    }
-                    
-                    Label {
-                        id: fpsLabel
-                        text: qsTr("FPS")
-                        font.bold: true
-                        visible: remoteFpsCheck.checked
-                        Layout.alignment: Qt.AlignVCenter
-                    }
-                }
+                onContentRequested: settingsPage.focusContent()
             }
         }
 
-        GroupBox {
-            id: audioSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">🎵 " + qsTr("Audio Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
+        SettingsScrollArea {
+            id: scrollArea
 
-            Column {
-                anchors.fill: parent
-                spacing: 5
+            anchors {
+                top: settingsPage.compact ? railBackground.bottom : parent.top
+                topMargin: settingsPage.compact ? Theme.spaceMd : 0
+                left: settingsPage.compact ? parent.left : railBackground.right
+                leftMargin: settingsPage.compact ? 0 : Theme.spaceLg
+                right: parent.right
+                bottom: parent.bottom
+            }
 
-                Label {
-                    width: parent.width
-                    id: resAudioTitle
-                    text: qsTr("Audio configuration")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
+            BasicSettingsPage {
+                id: basicPage
+                width: parent.width
+                visible: settingsPage.category === "basic"
+                height: visible ? implicitHeight : 0
+            }
 
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var saved_audio = StreamingPreferences.audioConfig
-                        currentIndex = 0
-                        for (var i = 0; i < audioListModel.count; i++) {
-                            var el_audio = audioListModel.get(i).val;
-                            if (saved_audio === el_audio) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
-                    }
+            DisplaySettingsPage {
+                id: displayPage
+                y: basicPage.height
+                width: parent.width
+                visible: settingsPage.category === "display"
+                height: visible ? implicitHeight : 0
+            }
 
-                    id: audioComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: audioListModel
-                        ListElement {
-                            text: qsTr("Stereo")
-                            val: StreamingPreferences.AC_STEREO
-                        }
-                        ListElement {
-                            text: qsTr("5.1 surround sound")
-                            val: StreamingPreferences.AC_51_SURROUND
-                        }
-                        ListElement {
-                            text: qsTr("7.1 surround sound")
-                            val: StreamingPreferences.AC_71_SURROUND
-                        }
-                        ListElement {
-                            text: qsTr("7.1.4 surround sound")
-                            val: StreamingPreferences.AC_714_SURROUND
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        StreamingPreferences.audioConfig = audioListModel.get(currentIndex).val
-                    }
-                }
+            LegacySettingsPage {
+                id: legacyPage
+                // 已迁移的新页面都在上面按顺序堆着，隐藏时高度为 0，所以这里累加即可
+                y: basicPage.height + displayPage.height
+                width: parent.width
+                category: settingsPage.category
 
+                onLanguageChanged: settingsPage.languageChanged()
+                onBitratePreferenceChanged: basicPage.syncBitrateFromPreferences()
+            }
 
-                CheckBox {
-                    id: audioPcCheck
-                    width: parent.width
-                    text: qsTr("Mute host PC speakers while streaming")
-                    font.pointSize: 12
-                    checked: !StreamingPreferences.playAudioOnHost
-                    onCheckedChanged: {
-                        StreamingPreferences.playAudioOnHost = !checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("You must restart any game currently in progress for this setting to take effect")
-                }
-
-                CheckBox {
-                    id: muteOnFocusLossCheck
-                    width: parent.width
-                    text: qsTr("Mute audio stream when Moonlight is not the active window")
-                    font.pointSize: 12
-                    visible: SystemProperties.hasDesktopEnvironment
-                    checked: StreamingPreferences.muteOnFocusLoss
-                    onCheckedChanged: {
-                        StreamingPreferences.muteOnFocusLoss = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Mutes Moonlight's audio when you Alt+Tab out of the stream or click on a different window.")
-                }
-                CheckBox {
-                    id: enableMicCheck
-                    width: parent.width
-                    text: qsTr("Enable microphone streaming(test)")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.enableMicrophone
-                    onCheckedChanged: {
-                        StreamingPreferences.enableMicrophone = checked
-                    }
+            EcosystemSettingsPage {
+                id: ecosystemPage
+                y: basicPage.height + displayPage.height + legacyPage.height
+                width: parent.width
+                visible: settingsPage.category === "ecosystem"
+                height: visible ? implicitHeight : 0
+                onAboutRequested: {
+                    settingsPage.category = "about"
+                    rail.focusCurrent()
+                    scrollArea.contentY = 0
                 }
             }
-        }
 
-        GroupBox {
-            id: hostSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">🖥️ " + qsTr("Host Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
-
-            Column {
-                anchors.fill: parent
-                spacing: 5
-
-                // 添加自定义屏幕模式选择器
-                Label {
-                    id: customScreenModeTitle
-                    width: parent.width
-                    text: qsTr("Custom Screen Mode")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var saved_mode = (StreamingPreferences.customScreenMode !== undefined && 
-                                          StreamingPreferences.customScreenMode !== null) ? 
-                                          StreamingPreferences.customScreenMode : -1
-                        currentIndex = 0
-                        for (var i = 0; i < customScreenModeListModel.count; i++) {
-                            var el_mode = customScreenModeListModel.get(i).val;
-                            if (saved_mode === el_mode) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
-                    }
-
-                    id: customScreenModeComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: customScreenModeListModel
-                        ListElement {
-                            text: qsTr("Nothing")
-                            val: -1
-                        }
-                        ListElement {
-                            text: qsTr("Disabled")
-                            val: 0
-                        }
-                        ListElement {
-                            text: qsTr("Activate the display automatically")
-                            val: 1
-                        }
-                        ListElement {
-                            text: qsTr("Activate the display automatically and make it a primary display")
-                            val: 2
-                        }
-                        ListElement {
-                            text: qsTr("Deactivate other displays and activate only the specified display")
-                            val: 3
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated: {
-                        if (enabled) {
-                            StreamingPreferences.customScreenMode = customScreenModeListModel.get(currentIndex).val
-                        }
-                    }
-                }
-
-                // VDD 屏幕模式选择器
-                Label {
-                    id: customVddScreenModeTitle
-                    width: parent.width
-                    text: qsTr("VDD Screen Mode")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    Component.onCompleted: {
-                        var saved_mode = (StreamingPreferences.customVddScreenMode !== undefined &&
-                                          StreamingPreferences.customVddScreenMode !== null) ?
-                                          StreamingPreferences.customVddScreenMode : -1
-                        currentIndex = 0
-                        for (var i = 0; i < customVddScreenModeListModel.count; i++) {
-                            var el_mode = customVddScreenModeListModel.get(i).val;
-                            if (saved_mode === el_mode) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
-                    }
-
-                    id: customVddScreenModeComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: customVddScreenModeListModel
-                        ListElement {
-                            text: qsTr("Use Sunshine host configuration (default)")
-                            val: -1
-                        }
-                        ListElement {
-                            text: qsTr("Keep current layout")
-                            val: 0
-                        }
-                        ListElement {
-                            text: qsTr("VDD primary + Physical extended")
-                            val: 1
-                        }
-                        ListElement {
-                            text: qsTr("Physical primary + VDD extended")
-                            val: 2
-                        }
-                        ListElement {
-                            text: qsTr("VDD only (disable physical displays)")
-                            val: 3
-                        }
-                    }
-                    onActivated: {
-                        if (enabled) {
-                            StreamingPreferences.customVddScreenMode = customVddScreenModeListModel.get(currentIndex).val
-                        }
-                    }
-                }
-
-                CheckBox {
-                    id: optimizeGameSettingsCheck
-                    width: parent.width
-                    text: qsTr("Optimize game settings for streaming")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.gameOptimizations
-                    onCheckedChanged: {
-                        StreamingPreferences.gameOptimizations = checked
-                    }
-                }
-
-                CheckBox {
-                    id: quitAppAfter
-                    width: parent.width
-                    text: qsTr("Quit app on host PC after ending stream")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.quitAppAfter
-                    onCheckedChanged: {
-                        StreamingPreferences.quitAppAfter = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("This will close the app or game you are streaming when you end your stream. You will lose any unsaved progress!")
-                }
+            AboutSettingsPage {
+                id: aboutPage
+                y: basicPage.height + displayPage.height + legacyPage.height + ecosystemPage.height
+                width: parent.width
+                visible: settingsPage.category === "about"
+                height: visible ? implicitHeight : 0
+                onScrollToEndRequested: scrollArea.scrollToEnd()
             }
-        }
 
-        GroupBox {
-            id: uiSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">🎨 " + qsTr("UI Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
-
-            Column {
-                anchors.fill: parent
-                spacing: 5
-
-                Label {
-                    width: parent.width
-                    id: languageTitle
-                    text: qsTr("Language")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var saved_language = StreamingPreferences.language
-                        currentIndex = 0
-                        for (var i = 0; i < languageListModel.count; i++) {
-                            var el_language = languageListModel.get(i).val;
-                            if (saved_language === el_language) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-
-                        activated(currentIndex)
-                    }
-
-                    id: languageComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: languageListModel
-                        ListElement {
-                            text: qsTr("Automatic")
-                            val: StreamingPreferences.LANG_AUTO
-                        }
-                        ListElement {
-                            text: "Deutsch" // German
-                            val: StreamingPreferences.LANG_DE
-                        }
-                        ListElement {
-                            text: "English"
-                            val: StreamingPreferences.LANG_EN
-                        }
-                        ListElement {
-                            text: "Français" // French
-                            val: StreamingPreferences.LANG_FR
-                        }
-                        ListElement {
-                            text: "简体中文" // Simplified Chinese
-                            val: StreamingPreferences.LANG_ZH_CN
-                        }
-                        ListElement {
-                            text: "Norwegian Bokmål"
-                            val: StreamingPreferences.LANG_NB_NO
-                        }
-                        ListElement {
-                            text: "русский" // Russian
-                            val: StreamingPreferences.LANG_RU
-                        }
-                        ListElement {
-                            text: "Español" // Spanish
-                            val: StreamingPreferences.LANG_ES
-                        }
-                        ListElement {
-                            text: "日本語" // Japanese
-                            val: StreamingPreferences.LANG_JA
-                        }
-                        ListElement {
-                            text: "Tiếng Việt" // Vietnamese
-                            val: StreamingPreferences.LANG_VI
-                        }
-                        ListElement {
-                            text: "ภาษาไทย" // Thai
-                            val: StreamingPreferences.LANG_TH
-                        }
-                        ListElement {
-                            text: "한국어" // Korean
-                            val: StreamingPreferences.LANG_KO
-                        }
-                        ListElement {
-                            text: "Magyar" // Hungarian
-                            val: StreamingPreferences.LANG_HU
-                        }
-                        ListElement {
-                            text: "Nederlands" // Dutch
-                            val: StreamingPreferences.LANG_NL
-                        }
-                        ListElement {
-                            text: "Svenska" // Swedish
-                            val: StreamingPreferences.LANG_SV
-                        }
-                        ListElement {
-                            text: "Türkçe" // Turkish
-                            val: StreamingPreferences.LANG_TR
-                        }
-                        /* ListElement {
-                            text: "Українська" // Ukrainian
-                            val: StreamingPreferences.LANG_UK
-                        } */
-                        ListElement {
-                            text: "繁體中文" // Traditional Chinese
-                            val: StreamingPreferences.LANG_ZH_TW
-                        }
-                        ListElement {
-                            text: "Português" // Portuguese
-                            val: StreamingPreferences.LANG_PT
-                        }
-                        ListElement {
-                            text: "Português do Brasil" // Brazilian Portuguese
-                            val: StreamingPreferences.LANG_PT_BR
-                        }
-                        ListElement {
-                            text: "Ελληνικά" // Greek
-                            val: StreamingPreferences.LANG_EL
-                        }
-                        ListElement {
-                            text: "Italiano" // Italian
-                            val: StreamingPreferences.LANG_IT
-                        }
-                        /* ListElement {
-                            text: "हिन्दी, हिंदी" // Hindi
-                            val: StreamingPreferences.LANG_HI
-                        } */
-                        ListElement {
-                            text: "Język polski" // Polish
-                            val: StreamingPreferences.LANG_PL
-                        }
-                        ListElement {
-                            text: "Čeština" // Czech
-                            val: StreamingPreferences.LANG_CS
-                        }
-                        /* ListElement {
-                            text: "עִבְרִית" // Hebrew
-                            val: StreamingPreferences.LANG_HE
-                        } */
-                        /* ListElement {
-                            text: "کرمانجیی خواروو" // Central Kurdish
-                            val: StreamingPreferences.LANG_CKB
-                        } */
-                        /* ListElement {
-                            text: "Lietuvių kalba" // Lithuanian
-                            val: StreamingPreferences.LANG_LT
-                        } */
-                        /* ListElement {
-                            text: "Eesti" // Estonian
-                            val: StreamingPreferences.LANG_ET
-                        } */
-                        ListElement {
-                            text: "Български" // Bulgarian
-                            val: StreamingPreferences.LANG_BG
-                        }
-                        /* ListElement {
-                            text: "Esperanto"
-                            val: StreamingPreferences.LANG_EO
-                        } */
-                        ListElement {
-                            text: "தமிழ்" // Tamil
-                            val: StreamingPreferences.LANG_TA
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        // Retranslating is expensive, so only do it if the language actually changed
-                        var new_language = languageListModel.get(currentIndex).val
-                        if (StreamingPreferences.language !== new_language) {
-                            StreamingPreferences.language = languageListModel.get(currentIndex).val
-                            if (!StreamingPreferences.retranslate()) {
-                                ToolTip.show(qsTr("You must restart Moonlight for this change to take effect"), 5000)
-                            }
-                            else {
-                                // Force the back operation to pop any AppView pages that exist.
-                                // The AppView stops working after retranslate() for some reason.
-                                window.clearOnBack = true
-
-                                // Signal other controls to adjust their text
-                                languageChanged()
-                            }
-                        }
-                    }
-                }
-
-                Label {
-                    width: parent.width
-                    id: uiDisplayModeTitle
-                    text: qsTr("GUI display mode")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                    visible: SystemProperties.hasDesktopEnvironment
-                }
-
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        if (!visible) {
-                            // Do nothing if the control won't even be visible
-                            return
-                        }
-
-                        var saved_uidisplaymode = StreamingPreferences.uiDisplayMode
-                        currentIndex = 0
-                        for (var i = 0; i < uiDisplayModeListModel.count; i++) {
-                            var el_uidisplaymode = uiDisplayModeListModel.get(i).val;
-                            if (saved_uidisplaymode === el_uidisplaymode) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-
-                        activated(currentIndex)
-                    }
-
-                    id: uiDisplayModeComboBox
-                    visible: SystemProperties.hasDesktopEnvironment
-                    textRole: "text"
-                    model: ListModel {
-                        id: uiDisplayModeListModel
-                        ListElement {
-                            text: qsTr("Windowed")
-                            val: StreamingPreferences.UI_WINDOWED
-                        }
-                        ListElement {
-                            text: qsTr("Maximized")
-                            val: StreamingPreferences.UI_MAXIMIZED
-                        }   
-                        ListElement {
-                            text: qsTr("Fullscreen")
-                            val: StreamingPreferences.UI_FULLSCREEN
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        StreamingPreferences.uiDisplayMode = uiDisplayModeListModel.get(currentIndex).val
-                    }
-                }
-
-                CheckBox {
-                    id: connectionWarningsCheck
-                    width: parent.width
-                    text: qsTr("Show connection quality warnings")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.connectionWarnings
-                    onCheckedChanged: {
-                        StreamingPreferences.connectionWarnings = checked
-                    }
-                }
-
-                CheckBox {
-                    id: configurationWarningsCheck
-                    width: parent.width
-                    text: qsTr("Show configuration warnings")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.configurationWarnings
-                    onCheckedChanged: {
-                        StreamingPreferences.configurationWarnings = checked
-                    }
-                }
-
-                CheckBox {
-                    visible: SystemProperties.hasDiscordIntegration
-                    id: discordPresenceCheck
-                    width: parent.width
-                    text: qsTr("Discord Rich Presence integration")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.richPresence
-                    onCheckedChanged: {
-                        StreamingPreferences.richPresence = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Updates your Discord status to display the name of the game you're streaming.")
-                }
-
-                CheckBox {
-                    id: keepAwakeCheck
-                    width: parent.width
-                    text: qsTr("Keep the display awake while streaming")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.keepAwake
-                    onCheckedChanged: {
-                        StreamingPreferences.keepAwake = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Prevents the screensaver from starting or the display from going to sleep while streaming.")
-                }
-
-                CheckBox {
-                    id: autoUpdateCheckBox
-                    width: parent.width
-                    text: qsTr("Automatically check for updates")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.autoUpdateCheck
-                    onCheckedChanged: {
-                        StreamingPreferences.autoUpdateCheck = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Check for new versions of Moonlight when the app starts.")
-                }
-
-                Label {
-                    width: parent.width
-                    text: qsTr("Overlay menu position")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    Component.onCompleted: {
-                        var saved = StreamingPreferences.overlayMenuPosition
-                        currentIndex = 0
-                        for (var i = 0; i < overlayMenuModel.count; i++) {
-                            if (overlayMenuModel.get(i).val === saved) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
-                    }
-
-                    id: overlayMenuComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: overlayMenuModel
-                        ListElement {
-                            text: qsTr("Right edge (default)")
-                            val: StreamingPreferences.OMP_RIGHT_EDGE
-                        }
-                        ListElement {
-                            text: qsTr("Left edge")
-                            val: StreamingPreferences.OMP_LEFT_EDGE
-                        }
-                        ListElement {
-                            text: qsTr("Floating button")
-                            val: StreamingPreferences.OMP_BUTTON
-                        }
-                        ListElement {
-                            text: qsTr("Disabled")
-                            val: StreamingPreferences.OMP_DISABLED
-                        }
-                    }
-                    onActivated: {
-                        StreamingPreferences.overlayMenuPosition = overlayMenuModel.get(currentIndex).val
-                    }
-                }
+            PeripheralsSettingsPage {
+                id: peripheralsPage
+                y: basicPage.height + displayPage.height + legacyPage.height
+                   + ecosystemPage.height + aboutPage.height
+                width: parent.width
+                visible: settingsPage.category === "peripherals"
+                height: visible ? implicitHeight : 0
             }
         }
     }
 
-    Column {
-        padding: 10
-        rightPadding: 20
-        anchors.left: settingsColumn1.right
-        id: settingsColumn2
-        width: settingsPage.width / 2
-        spacing: 15
-
-        GroupBox {
-            id: inputSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">⌨️ " + qsTr("Input Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
-
-            Column {
-                anchors.fill: parent
-                spacing: 5
-
-                CheckBox {
-                    id: absoluteMouseCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Optimize mouse for remote desktop instead of games")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.absoluteMouseMode
-                    onCheckedChanged: {
-                        StreamingPreferences.absoluteMouseMode = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("This enables seamless mouse control without capturing the client's mouse cursor. It is ideal for remote desktop usage but will not work in most games.") + " " +
-                                  qsTr("You can toggle this while streaming using Ctrl+Alt+Shift+M.") + "\n\n" +
-                                  qsTr("NOTE: Due to a bug in GeForce Experience, this option may not work properly if your host PC has multiple monitors.")
-                }
-
-                CheckBox {
-                    id: showLocalCursorCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Show local cursor")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.showLocalCursor
-                    onCheckedChanged: {
-                        StreamingPreferences.showLocalCursor = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 10000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("This makes the client's mouse cursor visible in the stream.") + " " +
-                                  qsTr("You can toggle this while streaming using Ctrl+Alt+Shift+C.")
-                }
-
-                Row {
-                    spacing: 5
-                    width: parent.width
-
-                    CheckBox {
-                        id: captureSysKeysCheck
-                        hoverEnabled: true
-                        text: qsTr("Capture system keyboard shortcuts")
-                        font.pointSize: 12
-                        enabled: SystemProperties.hasDesktopEnvironment
-                        checked: StreamingPreferences.captureSysKeysMode !== StreamingPreferences.CSK_OFF || !SystemProperties.hasDesktopEnvironment
-
-                        ToolTip.delay: 1000
-                        ToolTip.timeout: 10000
-                        ToolTip.visible: hovered
-                        ToolTip.text: qsTr("This enables the capture of system-wide keyboard shortcuts like Alt+Tab that would normally be handled by the client OS while streaming.") + "\n\n" +
-                                      qsTr("NOTE: Certain keyboard shortcuts like Ctrl+Alt+Del on Windows cannot be intercepted by any application, including Moonlight.")
-                    }
-
-                    AutoResizingComboBox {
-                        // ignore setting the index at first, and actually set it when the component is loaded
-                        Component.onCompleted: {
-                            if (!visible) {
-                                // Do nothing if the control won't even be visible
-                                return
-                            }
-
-                            var saved_syskeysmode = StreamingPreferences.captureSysKeysMode
-                            currentIndex = 0
-                            for (var i = 0; i < captureSysKeysModeListModel.count; i++) {
-                                var el_syskeysmode = captureSysKeysModeListModel.get(i).val;
-                                if (saved_syskeysmode === el_syskeysmode) {
-                                    currentIndex = i
-                                    break
-                                }
-                            }
-
-                            activated(currentIndex)
-                        }
-
-                        enabled: captureSysKeysCheck.checked && captureSysKeysCheck.enabled
-                        textRole: "text"
-                        model: ListModel {
-                            id: captureSysKeysModeListModel
-                            ListElement {
-                                text: qsTr("in fullscreen")
-                                val: StreamingPreferences.CSK_FULLSCREEN
-                            }
-                            ListElement {
-                                text: qsTr("always")
-                                val: StreamingPreferences.CSK_ALWAYS
-                            }
-                        }
-
-                        function updatePref() {
-                            if (!enabled) {
-                                StreamingPreferences.captureSysKeysMode = StreamingPreferences.CSK_OFF
-                            }
-                            else {
-                                StreamingPreferences.captureSysKeysMode = captureSysKeysModeListModel.get(currentIndex).val
-                            }
-                        }
-
-                        // ::onActivated must be used, as it only listens for when the index is changed by a human
-                        onActivated: {
-                            updatePref()
-                        }
-
-                        // This handles transition of the checkbox state
-                        onEnabledChanged: {
-                            updatePref()
-                        }
-                    }
-                }
-
-                CheckBox {
-                    id: absoluteTouchCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Use touchscreen as a virtual trackpad")
-                    font.pointSize:  12
-                    checked: !StreamingPreferences.absoluteTouchMode
-                    onCheckedChanged: {
-                        StreamingPreferences.absoluteTouchMode = !checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("When checked, the touchscreen acts like a trackpad. When unchecked, the touchscreen will directly control the mouse pointer.")
-                }
-
-                CheckBox {
-                    id: swapMouseButtonsCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Swap left and right mouse buttons")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.swapMouseButtons
-                    onCheckedChanged: {
-                        StreamingPreferences.swapMouseButtons = checked
-                    }
-                }
-                
-                CheckBox {
-                    id: swapWinAltKeysCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Swap Alt and Win keys")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.swapWinAltKeys
-                    onCheckedChanged: {
-                        StreamingPreferences.swapWinAltKeys = checked
-                    }
-                }
-
-                CheckBox {
-                    id: reverseScrollButtonsCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Reverse mouse scrolling direction")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.reverseScrollDirection
-                    onCheckedChanged: {
-                        StreamingPreferences.reverseScrollDirection = checked
-                    }
-                }
-            }
-        }
-
-        GroupBox {
-            id: gamepadSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">🎮 " + qsTr("Gamepad Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
-
-            Column {
-                anchors.fill: parent
-                spacing: 5
-
-                CheckBox {
-                    id: swapFaceButtonsCheck
-                    width: parent.width
-                    text: qsTr("Swap A/B and X/Y gamepad buttons")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.swapFaceButtons
-                    onCheckedChanged: {
-                        StreamingPreferences.swapFaceButtons = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("This switches gamepads into a Nintendo-style button layout")
-                }
-
-                CheckBox {
-                    id: singleControllerCheck
-                    width: parent.width
-                    text: qsTr("Force gamepad #1 always connected")
-                    font.pointSize:  12
-                    checked: !StreamingPreferences.multiController
-                    onCheckedChanged: {
-                        StreamingPreferences.multiController = !checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Forces a single gamepad to always stay connected to the host, even if no gamepads are actually connected to this PC.") + " " +
-                                  qsTr("Only enable this option when streaming a game that doesn't support gamepads being connected after startup.")
-                }
-
-                CheckBox {
-                    id: gamepadMouseCheck
-                    hoverEnabled: true
-                    width: parent.width
-                    text: qsTr("Enable mouse control with gamepads by holding the 'Start' button")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.gamepadMouse
-                    onCheckedChanged: {
-                        StreamingPreferences.gamepadMouse = checked
-                    }
-                }
-
-                CheckBox {
-                    id: backgroundGamepadCheck
-                    width: parent.width
-                    text: qsTr("Process gamepad input when Moonlight is in the background")
-                    font.pointSize: 12
-                    visible: SystemProperties.hasDesktopEnvironment
-                    checked: StreamingPreferences.backgroundGamepad
-                    onCheckedChanged: {
-                        StreamingPreferences.backgroundGamepad = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Allows Moonlight to capture gamepad inputs even if it's not the current window in focus")
-                }
-
-                Label {
-                    width: parent.width
-                    text: qsTr("Gamepad quit combo")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    Component.onCompleted: {
-                        var saved_combo = StreamingPreferences.gamepadQuitCombo
-                        currentIndex = 0
-                        for (var i = 0; i < gamepadQuitComboListModel.count; i++) {
-                            if (saved_combo === gamepadQuitComboListModel.get(i).val) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
-                    }
-
-                    id: gamepadQuitComboComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: gamepadQuitComboListModel
-                        ListElement {
-                            text: qsTr("Start + Select + L1 + R1 (Default)")
-                            val: StreamingPreferences.GQC_DEFAULT
-                        }
-                        ListElement {
-                            text: qsTr("Select + L1 + R1 + X")
-                            val: StreamingPreferences.GQC_SELECT_L1_R1_X
-                        }
-                        ListElement {
-                            text: qsTr("Select + L1 + R1 + Y")
-                            val: StreamingPreferences.GQC_SELECT_L1_R1_Y
-                        }
-                        ListElement {
-                            text: qsTr("Start + L1 + R1 + A")
-                            val: StreamingPreferences.GQC_START_L1_R1_A
-                        }
-                        ListElement {
-                            text: qsTr("Start + L1 + R1 + B")
-                            val: StreamingPreferences.GQC_START_L1_R1_B
-                        }
-                        ListElement {
-                            text: qsTr("L1 + R1 + X + Y")
-                            val: StreamingPreferences.GQC_L1_R1_X_Y
-                        }
-                        ListElement {
-                            text: qsTr("L1 + R1 + A + B")
-                            val: StreamingPreferences.GQC_L1_R1_A_B
-                        }
-                    }
-
-                    onActivated: {
-                        StreamingPreferences.gamepadQuitCombo = gamepadQuitComboListModel.get(currentIndex).val
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Choose which button combination exits streaming. Use alternatives if the default doesn't work on your device.")
-                }
-            }
-        }
-
-        GroupBox {
-            id: advancedSettingsGroupBox
-            width: (parent.width - (parent.leftPadding + parent.rightPadding))
-            padding: 12
-            title: "<b><font color=\"#FFA5D2\">⚗️ " + qsTr("Advanced Settings") + "</font></b>"
-            font: settingsPage.groupBoxTitleFont
-
-            Column {
-                anchors.fill: parent
-                spacing: 5
-
-                Label {
-                    width: parent.width
-                    id: resVDSTitle
-                    text: qsTr("Video decoder")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var saved_vds = StreamingPreferences.videoDecoderSelection
-                        currentIndex = 0
-                        for (var i = 0; i < decoderListModel.count; i++) {
-                            var el_vds = decoderListModel.get(i).val;
-                            if (saved_vds === el_vds) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
-                    }
-
-                    id: decoderComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: decoderListModel
-                        ListElement {
-                            text: qsTr("Automatic (Recommended)")
-                            val: StreamingPreferences.VDS_AUTO
-                        }
-                        ListElement {
-                            text: qsTr("Force software decoding")
-                            val: StreamingPreferences.VDS_FORCE_SOFTWARE
-                        }
-                        ListElement {
-                            text: qsTr("Force hardware decoding")
-                            val: StreamingPreferences.VDS_FORCE_HARDWARE
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated: {
-                        if (enabled) {
-                            StreamingPreferences.videoDecoderSelection = decoderListModel.get(currentIndex).val
-                        }
-                    }
-                    onCurrentIndexChanged: {
-                        if(decoderListModel.get(currentIndex).val === StreamingPreferences.VDS_FORCE_SOFTWARE){
-                            videoEnhancementCheck.enabled = false;
-                            videoEnhancementCheck.keepValue = videoEnhancementCheck.checked;
-                            videoEnhancementCheck.checked = false;
-                        } else {
-                            videoEnhancementCheck.enabled = true;
-                            videoEnhancementCheck.checked = videoEnhancementCheck.keepValue;
-                        }
-                    }
-                }
-
-                Label {
-                    width: parent.width
-                    id: resVCCTitle
-                    text: qsTr("Video codec")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var saved_vcc = StreamingPreferences.videoCodecConfig
-
-                        // Default to Automatic (relevant if HDR is enabled,
-                        // where we will match none of the codecs in the list)
-                        currentIndex = 0
-
-                        for(var i = 0; i < codecListModel.count; i++) {
-                            var el_vcc = codecListModel.get(i).val;
-                            if (saved_vcc === el_vcc) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-
-                        activated(currentIndex)
-                    }
-
-                    id: codecComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: codecListModel
-                        ListElement {
-                            text: qsTr("Automatic (Recommended)")
-                            val: StreamingPreferences.VCC_AUTO
-                        }
-                        ListElement {
-                            text: qsTr("H.264")
-                            val: StreamingPreferences.VCC_FORCE_H264
-                        }
-                        ListElement {
-                            text: qsTr("HEVC (H.265)")
-                            val: StreamingPreferences.VCC_FORCE_HEVC
-                        }
-                        ListElement {
-                            text: qsTr("AV1 (Experimental)")
-                            val: StreamingPreferences.VCC_FORCE_AV1
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        if (enabled) {
-                            StreamingPreferences.videoCodecConfig = codecListModel.get(currentIndex).val
-                        }
-                    }
-                }
-
-                CheckBox {
-                    id: enableHdr
-                    width: parent.width
-                    text: qsTr("Enable HDR (Experimental)")
-                    font.pointSize: 12
-
-                    enabled: SystemProperties.supportsHdr
-                    checked: enabled && StreamingPreferences.enableHdr
-                    onCheckedChanged: {
-                        StreamingPreferences.enableHdr = checked
-                    }
-
-                    // Updating StreamingPreferences.videoCodecConfig is handled above
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: enabled ?
-                                      qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
-                                    :
-                                      qsTr("HDR streaming is not supported on this PC.")
-                }
-
-                ComboBox {
-                    id: hdrModeComboBox
-                    width: parent.width
-                    font.pointSize: 12
-                    enabled: enableHdr.checked
-                    textRole: "text"
-                    model: ListModel {
-                        id: hdrModeListModel
-                        ListElement {
-                            text: "HDR10 (PQ)"
-                            val: 1
-                        }
-                        ListElement {
-                            text: "HLG"
-                            val: 2
-                        }
-                    }
-
-                    Component.onCompleted: {
-                        for (var i = 0; i < hdrModeListModel.count; i++) {
-                            if (hdrModeListModel.get(i).val === StreamingPreferences.hdrMode) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                    }
-
-                    onActivated: {
-                        if (enabled) {
-                            StreamingPreferences.hdrMode = hdrModeListModel.get(currentIndex).val
-                        }
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("HDR10 (PQ) is the standard HDR format. HLG offers better compatibility with SDR displays when HDR is not active on the host.")
-                }
-
-                CheckBox {
-                    id: enableYUV444
-                    width: parent.width
-                    text: qsTr("Enable YUV 4:4:4 (Experimental)")
-                    font.pointSize: 12
-
-                    checked: StreamingPreferences.enableYUV444
-                    onCheckedChanged: {
-                        // This is called on init, so only reset to default bitrate when checked state changes.
-                        if (StreamingPreferences.enableYUV444 != checked) {
-                            StreamingPreferences.enableYUV444 = checked
-                            if (StreamingPreferences.autoAdjustBitrate) {
-                                StreamingPreferences.bitrateKbps = StreamingPreferences.getDefaultBitrate(StreamingPreferences.width,
-                                                                                                          StreamingPreferences.height,
-                                                                                                          StreamingPreferences.fps,
-                                                                                                          StreamingPreferences.enableYUV444);
-                                slider.value = Math.log(StreamingPreferences.bitrateKbps)
-                            }
-                        }
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: enabled ?
-                                      qsTr("Good for streaming desktop and text-heavy games, but not recommended for fast-paced games.")
-                                    :
-                                      qsTr("YUV 4:4:4 is not supported on this PC.")
-                }
-
-                CheckBox {
-                    id: enableMdns
-                    width: parent.width
-                    text: qsTr("Automatically find PCs on the local network (Recommended)")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.enableMdns
-                    onCheckedChanged: {
-                        // This is called on init, so only do the work if we've
-                        // actually changed the value.
-                        if (StreamingPreferences.enableMdns != checked) {
-                            StreamingPreferences.enableMdns = checked
-
-                            // Restart polling so the mDNS change takes effect
-                            if (window.pollingActive) {
-                                ComputerManager.stopPollingAsync()
-                                ComputerManager.startPolling()
-                            }
-                        }
-                    }
-                }
-
-                CheckBox {
-                    id: detectNetworkBlocking
-                    width: parent.width
-                    text: qsTr("Automatically detect blocked connections (Recommended)")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.detectNetworkBlocking
-                    onCheckedChanged: {
-                        StreamingPreferences.detectNetworkBlocking = checked
-                    }
-                }
-
-                CheckBox {
-                    id: showPerformanceOverlay
-                    width: parent.width
-                    text: qsTr("Show performance stats while streaming")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.showPerformanceOverlay
-                    onCheckedChanged: {
-                        StreamingPreferences.showPerformanceOverlay = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Display real-time stream performance information while streaming.") + "\n\n" +
-                                  qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+S or Select+L1+R1+X.") + "\n\n" +
-                                  qsTr("The performance overlay is not supported on Steam Link or Raspberry Pi.")
-                }
-            }
-        }
+    Component.onCompleted: {
+        // 语言切换需要重建若干下拉的模型
+        settingsPage.languageChanged.connect(basicPage.languageChanged)
+        settingsPage.languageChanged.connect(displayPage.languageChanged)
     }
 }
