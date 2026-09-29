@@ -13,7 +13,7 @@
 	<key>CFBundleIconFile</key>
 	<string>moonlight</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.alkaidlab.vpluspc</string>
+	<string>com.moonlight-stream.Moonlight2</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>CFBundlePackageType</key>
